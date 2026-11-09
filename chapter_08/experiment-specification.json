@@ -1,0 +1,312 @@
+{
+  "experiment_id": "exp-08-transactional-execution-reversible-actions-v1",
+  "hypothesis": "Wrapping agent tool invocations in an explicit transactional layer with logged reversible (compensating) actions will (a) prevent durable partial side effects in the presence of mid-workflow failures, and (b) allow deterministic, reproducible recovery of system state to a previously consistent checkpoint, compared with a baseline agent that calls tools directly.",
+  "baseline": {
+    "description": "An agent orchestrator that invokes side-effecting tools (e.g., file writes and in-memory order updates) directly, without transactional semantics, logging, or compensating actions. Each tool applies its side effects immediately and irreversibly from the orchestrator's perspective. If any subsequent tool fails or the agent crashes, previously applied side effects remain, resulting in partial writes and inconsistent state.",
+    "components": [
+      "BaselineAgent: simple Python class that executes a fixed workflow of tool calls in sequence.",
+      "FileTool: writes JSON records to a file without any notion of transaction or rollback.",
+      "InMemoryOrderStore: Python dictionary or list representing orders, modified in-place without history or undo metadata."
+    ],
+    "workflow": [
+      "Step 1: Create an 'order' object and persist it to InMemoryOrderStore.",
+      "Step 2: Append a record for the order to a 'ledger.json' file via FileTool.",
+      "Step 3: Perform a 'payment' step that may raise an exception (simulated failure) after some side effects have already occurred."
+    ]
+  },
+  "treatment": {
+    "description": "A transactional agent execution layer that wraps side-effecting tool calls in transactions and sagas using reversible operations. Each tool invocation must provide both a 'do' operation and a 'compensate' (undo) operation, and all calls are logged by a RecoveryCoordinator. On failure, the coordinator replays compensating actions in reverse order to restore the system to the pre-workflow consistent state (as far as the domain allows).",
+    "components": [
+      "TransactionalAgent: orchestrator that executes the same logical workflow as BaselineAgent, but routes all side-effecting operations through a TransactionManager.",
+      "TransactionManager: coordinates begin/commit/rollback semantics at the application level, collecting ActionLogEntries for each reversible tool invocation.",
+      "ActionLogEntry: record capturing tool identifier, parameters, do/compensate functions or descriptors, and status, append-only stored in a log.",
+      "RecoveryCoordinator: reads action logs for failed transactions and executes compensating actions in reverse order, with idempotent semantics and error handling.",
+      "TransactionalFileTool: wraps FileTool to implement reversible operations (e.g., write with previous-content snapshot and delete-on-rollback, or append with truncate-on-rollback).",
+      "TransactionalOrderStore: wraps InMemoryOrderStore, recording prior values so that inserted/updated orders can be removed or reverted on rollback."
+    ],
+    "workflow": [
+      "Step 1: TransactionManager.begin(transaction_id).",
+      "Step 2: TransactionalOrderStore.create_order() via TransactionManager.do(), which records a compensating delete on rollback.",
+      "Step 3: TransactionalFileTool.append_ledger_entry() via TransactionManager.do(), which records prior file size/content for rollback.",
+      "Step 4: Simulated payment step that may raise an exception mid-transaction.",
+      "On success: TransactionManager.commit() finalizes log and marks transaction as completed.",
+      "On failure: TransactionManager.rollback() triggers RecoveryCoordinator to execute compensating actions in LIFO order."
+    ]
+  },
+  "workloads": [
+    {
+      "id": "workload-1-partial-write-failure-baseline-vs-transactional",
+      "description": "Deterministic scenario where the third step in the workflow ('payment') raises an exception after earlier file and in-memory writes have succeeded.",
+      "steps": [
+        "Initialize clean environment: remove or truncate 'ledger.json'; clear in-memory order store.",
+        "Configure both BaselineAgent and TransactionalAgent with identical tool implementations (transactional wrappers only used by TransactionalAgent).",
+        "Inject deterministic failure in payment step (e.g., raising a FixedFailureException after prior steps).",
+        "Run BaselineAgent workflow once and record resulting file contents and in-memory state.",
+        "Reset environment to clean state.",
+        "Run TransactionalAgent workflow once and record resulting file contents, in-memory state, and transaction log."
+      ],
+      "expected_behavior_baseline": "After failure, 'ledger.json' contains the newly appended entry and the order store contains the partially created order, even though payment failed.",
+      "expected_behavior_treatment": "After failure and rollback, 'ledger.json' does not contain the entry associated with the failed transaction, and the order store does not contain the partially created order."
+    },
+    {
+      "id": "workload-2-randomized-failure-points",
+      "description": "Run multiple iterations of the workflow while randomly injecting failures after each tool invocation to validate that rollback consistently restores pre-transaction state for all failure points.",
+      "steps": [
+        "Initialize clean environment at start of test run.",
+        "For N iterations (e.g., N=20 configurable via test parameter):",
+        "  - Choose a random failure point in {after-order-create, after-ledger-append, after-payment-logic}.",
+        "  - Run BaselineAgent with failure injected at that point and record state snapshots.",
+        "  - Reset environment.",
+        "  - Run TransactionalAgent with failure injected at the same logical point and record state snapshots and action logs."
+      ],
+      "expected_behavior_baseline": "Across iterations, baseline leaves a mixture of partial orders and ledger entries whenever failures occur after some side effects.",
+      "expected_behavior_treatment": "For all injected failure points during transactional runs, post-rollback state matches pre-transaction state for the controlled resources (order store and ledger file)."
+    },
+    {
+      "id": "workload-3-recovery-from-crash-using-persisted-log",
+      "description": "Simulate process crash after some actions have succeeded but before rollback has been triggered, then use the persisted transaction log to recover and apply compensating actions on restart.",
+      "steps": [
+        "Modify TransactionManager to persist ActionLogEntries to a durable log file (e.g., 'transactions.log').",
+        "Scenario A (baseline, for contrast): BaselineAgent runs and the process is forcibly terminated after a partial set of actions; on restart no recovery logic is available beyond manual inspection.",
+        "Scenario B (treatment): TransactionalAgent runs with the same failure point; before rollback can be invoked, simulate crash by terminating the process after the last side effect but before calling commit or rollback.",
+        "On restart, instantiate RecoveryCoordinator, load incomplete transactions from 'transactions.log', and execute compensating actions.",
+        "Compare system state before workflow, after crash but before recovery, and after recovery."
+      ],
+      "expected_behavior_baseline": "No automated rollback; partial side effects remain and must be cleaned manually.",
+      "expected_behavior_treatment": "After recovery invocation on restart, controlled resources revert to the pre-transaction state, as indicated by pre/post snapshots."
+    },
+    {
+      "id": "workload-4-integration-with-real-database-or-sqlite-optional",
+      "description": "Optional workload showing coordination with a transactional database (e.g., SQLite) and a non-transactional side effect (file write) to illustrate local DB transactions plus compensating saga for the file.",
+      "steps": [
+        "Use SQLite in-memory or file-based DB with a simple 'orders' table using native SQL transactions.",
+        "Wrap DB operations in TransactionalDbTool that participates in TransactionManager (begin/commit/rollback delegating to DB transaction).",
+        "Use TransactionalFileTool for external ledger writes.",
+        "Run a workflow where DB insert and file append should both succeed or both be rolled back in the face of a simulated failure between them.",
+        "Compare DB and file state across baseline vs. treatment workflows with the same induced failures."
+      ],
+      "expected_behavior_baseline": "DB transaction may roll back correctly, but non-transactional file writes remain, creating inconsistency.",
+      "expected_behavior_treatment": "Both DB and file reflect consistent, all-or-nothing behavior by combining native DB transaction with compensating file action."
+    }
+  ],
+  "controls": {
+    "randomness_control": "Use fixed random seeds (e.g., via Python's random.seed) in tests that choose randomized failure points to ensure reproducibility of failure injection sequences.",
+    "environment_isolation": "Each test case must run in an isolated temporary directory (e.g., via pytest tmp_path fixture) so that ledger and transaction logs do not interfere across tests.",
+    "state_snapshotting": "Implement helper functions to snapshot the relevant state before and after runs (e.g., reading ledger file contents, deep-copying in-memory order store) to allow deterministic comparisons.",
+    "time_control": "Avoid reliance on wall-clock time in logic; if timestamps are logged, exclude them from equality assertions, or normalize them, to keep tests deterministic.",
+    "idempotency_checks": "RecoveryCoordinator should be written to be idempotent with respect to partially applied compensations so that re-running recovery does not corrupt state; tests should verify safe re-execution of recovery.",
+    "consistent_inputs": "Baseline and treatment must receive identical logical inputs (same order IDs, amounts, etc.) in each paired test to ensure comparisons focus solely on transactional behavior.",
+    "logging_verbosity": "Provide structured logs but do not assert on log content for correctness, only on resultant state; this avoids brittle tests while providing evidence during manual inspection."
+  },
+  "metrics": [
+    {
+      "name": "partial_side_effects_count",
+      "unit": "count of experiments where persistent state differs from pre-transaction snapshot after a failed workflow",
+      "description": "For each failed run, whether any controlled resource (order store, ledger file) contains a new or modified entry associated with the failed transaction."
+    },
+    {
+      "name": "rollback_success_rate",
+      "unit": "percentage of failed transactional runs where post-recovery state matches pre-transaction snapshot",
+      "description": "Computed as (# failed transactional runs with full state equality) / (# total failed transactional runs)."
+    },
+    {
+      "name": "recovery_time",
+      "unit": "milliseconds per recovery invocation",
+      "description": "Elapsed time from initiating rollback or post-crash recovery until all compensating actions complete; mainly for qualitative overhead assessment.",
+      "note": "Reported empirically by users; do not hard-code expected values in tests."
+    },
+    {
+      "name": "log_entries_per_transaction",
+      "unit": "count of ActionLogEntries",
+      "description": "Number of recorded actions for each transaction, used to verify coverage of all side-effecting operations."
+    },
+    {
+      "name": "compensation_failures",
+      "unit": "count",
+      "description": "Number of times a compensating action raises an exception during rollback or recovery; used to explore limitations and failure modes of reversibility."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "In workload-1, for the same induced failure point, BaselineAgent leaves at least one partial side effect (i.e., partial_side_effects_count >= 1 over the test suite) while TransactionalAgent leaves zero partial side effects for controlled resources after rollback.",
+      "In workload-2, TransactionalAgent achieves rollback_success_rate == 1.0 (100%) across all randomized failure points for the controlled resource set defined in the implementation.",
+      "In workload-3, after simulated crash and RecoveryCoordinator invocation, TransactionalAgent's post-recovery state (orders and ledger) is equal to the pre-transaction state snapshot for the tested transaction.",
+      "For all workloads, each side-effecting operation executed via TransactionalAgent produces at least one corresponding ActionLogEntry, and the number of log_entries_per_transaction is equal to the number of side-effecting operations in the workflow."
+    ],
+    "secondary": [
+      "recovery_time remains within an order of magnitude of a single full forward workflow execution under test environment conditions, indicating that rollback overhead is acceptable for many production use cases.",
+      "compensation_failures is zero in the defined happy-path tests, and additional adversarial tests document and handle at least one intentionally induced compensation failure scenario."
+    ],
+    "notes": "Quantitative thresholds aside from 0 partial side effects and 100% rollback success are intentionally loose; the main goal is to demonstrate correctness and reversibility rather than performance benchmarking."
+  },
+  "failure_modes": [
+    {
+      "name": "non_reversible_side_effects",
+      "description": "Some tools may perform actions that cannot be meaningfully reversed (e.g., sending an email, external HTTP POST without a delete API). In such cases, compensating actions can only approximate reversal (e.g., sending a follow-up correction message), which must be explicitly documented and may not fully restore the pre-transaction world state.",
+      "detection": "Tests that intentionally include an irreversible tool should mark expected irreversibility and ensure that transactional layer does not silently claim full rollback.",
+      "mitigation": "Document irreversible operations; route them through separate, higher-risk paths (e.g., human approval gates) and do not treat them as fully transactional."
+    },
+    {
+      "name": "compensating_action_failure",
+      "description": "During rollback or recovery, a compensating action may itself fail (e.g., file already deleted, DB row missing, network error). This can leave the system in an unknown or partially recovered state.",
+      "detection": "Include adversarial tests where the environment is modified between forward and rollback phases (e.g., manually deleting files) to trigger compensation errors.",
+      "mitigation": "Design compensating actions to be idempotent and tolerant of missing resources; log and surface compensation failures, and provide hooks for escalation or manual intervention."
+    },
+    {
+      "name": "log_corruption_or_loss",
+      "description": "The transaction log used by RecoveryCoordinator may become corrupted, truncated, or lost (e.g., disk failure or application bug), making automated recovery incomplete or impossible.",
+      "detection": "Tests simulating corrupted log entries (e.g., invalid JSON) should show that RecoveryCoordinator fails safely rather than applying incorrect compensations.",
+      "mitigation": "Use append-only, checksummed logs or rely on external transactional storage where possible; on detection of corruption, halt automated recovery and escalate to manual runbooks."
+    },
+    {
+      "name": "concurrency_and_interleaving_issues",
+      "description": "Concurrent transactions modifying shared resources may interleave in ways that make simple compensations incorrect (e.g., two agents appending to the same file).",
+      "detection": "This experiment focuses on single-agent, single-transaction flows; concurrency-specific tests should be separate and clearly documented as out of scope for this chapter.",
+      "mitigation": "In production, combine transactional layer with concurrency control (locks, database isolation levels, per-transaction workspaces) and carefully reason about compensation semantics under interleaving."
+    },
+    {
+      "name": "agent_bypassing_transaction_layer",
+      "description": "The agent or a tool may accidentally or maliciously perform side effects outside the transactional wrappers, leading to uncontrolled, irreversible changes.",
+      "detection": "Static analysis or runtime scanning of allowed tool interfaces; tests that intentionally call a non-transactional tool verify that such calls are either blocked or plainly recognized as out-of-transaction.",
+      "mitigation": "Expose only transactional tool interfaces to the agent in production deployments; enforce least privilege and capability-based policies at the tool layer."
+    }
+  ],
+  "required_environment": {
+    "language_runtime": "Python 3.10+",
+    "os": "Linux, macOS, or Windows; tests must be OS-agnostic by relying only on standard filesystem behavior.",
+    "dependencies": [
+      "pytest>=7.0",
+      "typing-extensions (if using newer typing features on older Python minor versions)"
+    ],
+    "repository_layout": {
+      "chapter_dir": "chapter_08_transactional_execution",
+      "source_files": [
+        "chapter_08_transactional_execution/transactional_agent.py",
+        "chapter_08_transactional_execution/tools.py",
+        "chapter_08_transactional_execution/transaction_manager.py",
+        "chapter_08_transactional_execution/recovery.py"
+      ],
+      "test_files": [
+        "chapter_08_transactional_execution/tests/test_baseline_vs_transactional.py",
+        "chapter_08_transactional_execution/tests/test_randomized_failures.py",
+        "chapter_08_transactional_execution/tests/test_recovery_from_crash.py",
+        "chapter_08_transactional_execution/tests/test_compensation_failure_modes.py"
+      ]
+    },
+    "external_services": "No external network dependencies are required. All experiments should run entirely locally using filesystem and in-memory data structures. Optional SQLite integration in workload-4 uses Python's built-in sqlite3 module.",
+    "resource_requirements": "Experiments are lightweight and should run comfortably on a developer laptop with <100MB RAM and <1 minute runtime."
+  },
+  "run_instructions": {
+    "setup": [
+      "Clone the repository: git clone https://github.com/juancabreramware/ai-agent-on-a-leash.git",
+      "cd ai-agent-on-a-leash",
+      "Ensure Python 3.10+ is available: python --version",
+      "Create and activate a virtual environment (optional but recommended).",
+      "Install dependencies: pip install -r requirements.txt (or at minimum: pip install pytest)."
+    ],
+    "test_commands": [
+      "Run all chapter 8 tests: pytest chapter_08_transactional_execution",
+      "Run baseline vs transactional comparison tests: pytest chapter_08_transactional_execution/tests/test_baseline_vs_transactional.py",
+      "Run randomized failure-point tests: pytest chapter_08_transactional_execution/tests/test_randomized_failures.py",
+      "Run crash-recovery tests: pytest chapter_08_transactional_execution/tests/test_recovery_from_crash.py",
+      "Run compensation failure-mode tests: pytest chapter_08_transactional_execution/tests/test_compensation_failure_modes.py"
+    ],
+    "parameterization": [
+      "Use pytest -k to select specific workloads or scenarios (e.g., pytest -k 'workload_2' ...).",
+      "Use environment variables or pytest command-line options (e.g., --iterations=50) to adjust the number of randomized runs in workload-2; ensure defaults are documented and runtime remains reasonable."
+    ],
+    "result_interpretation": [
+      "All tests passing indicates that the implemented transactional and recovery semantics meet the specified success criteria for the defined workloads.",
+      "Inspect generated files in the test's temporary directories (pytest's tmp_path) or enable verbose logging to manually observe baseline partial side effects versus transactional rollback behavior.",
+      "For optional SQLite integration tests, review the DB file and ledger file after runs to confirm coordinated rollback behavior qualitatively."
+    ],
+    "reproducibility_notes": [
+      "Tests that use randomness must set random.seed to a fixed value at the beginning of each test to ensure deterministic behavior across runs.",
+      "Do not modify test data or expected state snapshots without updating associated documentation; changes may invalidate cross-run comparisons."
+    ]
+  },
+  "evidence_schema": {
+    "description": "Structure for capturing and storing experimental outcomes without fabricating specific values in this specification. Implementations should populate concrete instances of this schema when experiments are executed.",
+    "fields": {
+      "experiment_run_id": {
+        "type": "string",
+        "description": "Unique identifier for a particular invocation of the test suite or individual workload execution, e.g., a timestamped UUID."
+      },
+      "experiment_id": {
+        "type": "string",
+        "description": "Reference to this experiment specification, e.g., 'exp-08-transactional-execution-reversible-actions-v1'."
+      },
+      "workload_id": {
+        "type": "string",
+        "description": "Identifier of the workload, e.g., 'workload-1-partial-write-failure-baseline-vs-transactional'."
+      },
+      "variant": {
+        "type": "string",
+        "allowed_values": [
+          "baseline",
+          "treatment"
+        ],
+        "description": "Indicates whether the recorded evidence is for the baseline or transactional variant."
+      },
+      "inputs": {
+        "type": "object",
+        "description": "Serialized representation of input parameters for the run (e.g., order ID, amount, failure injection point, random seed, iteration number).",
+        "example_keys": [
+          "order_id",
+          "amount",
+          "failure_point",
+          "random_seed",
+          "iteration"
+        ]
+      },
+      "pre_state_snapshot": {
+        "type": "object",
+        "description": "Snapshot of relevant system state before execution, including hashes or full contents where sizes are small.",
+        "fields": {
+          "order_store": "Structured representation of in-memory orders or DB rows.",
+          "ledger_contents": "String or list of JSON entries from ledger file before run.",
+          "other_resources": "Optional additional state, such as DB content or queue depths."
+        }
+      },
+      "post_state_snapshot": {
+        "type": "object",
+        "description": "Same structure as pre_state_snapshot, captured after execution (and rollback/recovery, if applicable)."
+      },
+      "metrics": {
+        "type": "object",
+        "description": "Concrete measured values for the metrics defined in this experiment.",
+        "fields": {
+          "partial_side_effects_count": "integer",
+          "rollback_success_rate": "float or null (usually aggregated over multiple iterations, so may be absent for single run records).",
+          "recovery_time_ms": "float",
+          "log_entries_per_transaction": "integer",
+          "compensation_failures": "integer"
+        }
+      },
+      "logs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional list of human-readable log lines or structured logs emitted during the run. These should be captured directly from execution, not invented."
+      },
+      "status": {
+        "type": "string",
+        "allowed_values": [
+          "success",
+          "failure",
+          "partial"
+        ],
+        "description": "Outcome of the workflow run from the orchestration perspective, e.g., 'failure' when an induced exception occurs and 'success' when the full workflow completes."
+      },
+      "rollback_invoked": {
+        "type": "boolean",
+        "description": "Indicates whether rollback or recovery was triggered during this run."
+      },
+      "notes": {
+        "type": "string",
+        "description": "Free-text field for annotating anomalies, environment details, or observations that may be relevant for later analysis."
+      }
+    }
+  }
+}

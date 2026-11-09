@@ -1,0 +1,3 @@
+# Runtime is standard library only; this file exists for completeness.
+# You may still install dev tools (pytest, etc.) if desired, but they are
+# not required for running `python run.py` or the built-in unittest suite.

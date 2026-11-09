@@ -1,0 +1,380 @@
+{
+  "experiment_id": "chap13-secure-memory-context-mgmt-v1",
+  "hypothesis": "A scoped, policy-enforced memory manager that isolates per-task context and applies redaction rules will prevent cross-context data leaks and unauthorized reads, while still allowing each task to access its own relevant history and shared non-sensitive data. In controlled adversarial scenarios, attempts to retrieve sensitive data from a different task's scope or from redacted segments will return no sensitive content under the treatment, but will succeed under the baseline.",
+  "baseline": {
+    "description": "Single global, unpartitioned memory store shared across all tasks and agents, with naive retrieval based only on task identifiers or free-text search and no enforced access policies or redaction. The agent (or test harness) can write arbitrary items tagged with a task_id but the retrieval API does not strictly enforce that callers only see memory belonging to their own task or role. No structured handling of sensitive fields (PII, secrets); redaction, if any, is purely prompt-based or informal.",
+    "key_characteristics": [
+      "One in-memory store (e.g., a list or dict) keyed by simple IDs or plain text.",
+      "No hard isolation between tasks: it is possible to query by broad filters or search that spans tasks.",
+      "No formal access control model (no roles, no policies) \u2013 any caller of the API can request any memory item.",
+      "No deterministic redaction; sensitive fields (e.g., email, API keys) are stored and returned in plaintext.",
+      "Agent or tests can simulate prompt-based access (e.g., 'search all memories for ...') without guardrails."
+    ],
+    "interfaces": {
+      "write_memory": "write_memory(task_id: str, content: str, metadata: dict | None = None) -> None",
+      "read_memory": "read_memory(filter: dict | None = None) -> list[dict]"
+    }
+  },
+  "treatment": {
+    "description": "Scoped memory manager implementing strict task- and role-based isolation, plus configurable redaction policies for sensitive fields. Each memory item is labeled with a scope descriptor (task_id, tenant_id, role, sensitivity level). Retrieval APIs require a ContextToken indicating the caller's identity, allowed scopes, and role. The memory manager enforces that callers may only see: (a) items in their own task scope; (b) optionally whitelisted shared, non-sensitive items; and (c) redacted views of items where policies require masking. Attempts to access other tasks' private memories or unredacted sensitive fields are denied or return sanitized content.",
+    "key_characteristics": [
+      "Explicit ContextToken object encapsulating {task_id, tenant_id, role, permissions} required on every read/write.",
+      "Per-task and per-tenant isolation: memory items are tagged and only visible to allowed scopes.",
+      "Configurable access policies governing which roles (e.g., 'agent', 'supervisor', 'auditor') can see which scopes.",
+      "Redaction rules applied at read time for sensitive fields (e.g., mask emails, secrets) based on sensitivity level and caller role.",
+      "Audit-friendly decisions: every denied or redacted retrieval is labeled (e.g., via structured result flags) for analysis.",
+      "Same logical interface as baseline at the test harness level, but calls go through ContextManager enforcing isolation."
+    ],
+    "interfaces": {
+      "ContextToken": "ContextToken(task_id: str, tenant_id: str, role: str, allowed_scopes: set[str])",
+      "ScopedMemoryStore": {
+        "write": "write(ctx: ContextToken, content: dict, sensitivity: str = 'normal') -> None",
+        "query": "query(ctx: ContextToken, query: dict) -> list[dict]",
+        "query_redacted": "query_redacted(ctx: ContextToken, query: dict) -> list[dict]  # applies redaction view"
+      }
+    }
+  },
+  "workloads": [
+    {
+      "name": "WL1_cross_task_private_leak",
+      "description": "Simulated multi-task environment where Task A stores private user data (e.g., email, partial credit card), and Task B attempts to retrieve that data by querying the memory store with broad filters and crafted queries.",
+      "steps": [
+        "Initialize baseline and treatment memory stores with identical starting conditions (empty, same config where applicable).",
+        "Create ContextTokens (treatment) or task identifiers (baseline) for task_a and task_b within the same tenant.",
+        "Under both baseline and treatment, have task_a write a set of private memory items, e.g. user profile with email and last4 of card.",
+        "Under baseline, have task_b run a sequence of read_memory operations attempting to discover task_a's data using naive filters (e.g., no task filter, or wildcard filter).",
+        "Under treatment, have task_b run equivalent queries via ScopedMemoryStore.query with its own ContextToken.",
+        "Record which queries return any fields matching the known sensitive values from task_a (ground truth)."
+      ],
+      "inputs": {
+        "tasks": [
+          "task_a: user-support-session-123",
+          "task_b: unrelated-analytics-job-456"
+        ],
+        "sensitive_values": {
+          "email": "alice@example.com",
+          "card_last4": "4242"
+        },
+        "queries": [
+          "no-filter (baseline only, returns all items)",
+          "filter by tenant_id only (treatment, allowed_scopes does not include task_a)",
+          "text search for 'alice@example.com'",
+          "metadata-based search for user_id='user-001'"
+        ]
+      }
+    },
+    {
+      "name": "WL2_redaction_within_allowed_scope",
+      "description": "Caller has legitimate access to a task's memory but should not see raw sensitive fields due to redaction rules; verify that baseline leaks raw values while treatment returns masked values for certain roles.",
+      "steps": [
+        "Initialize baseline and treatment stores.",
+        "Create a ContextToken for role='agent' and another for role='auditor' within the same task and tenant.",
+        "Write several memory entries with mixed sensitivity levels: normal notes, PII (email, phone), and secret tokens.",
+        "Under baseline, perform read operations as 'agent' and 'auditor' (simulated roles in test harness) and observe that all raw fields are visible.",
+        "Under treatment, perform ScopedMemoryStore.query_redacted as 'agent' and as 'auditor'.",
+        "Verify that for role='agent', sensitive fields are masked, while role='auditor' may see them fully or partially according to policy."
+      ],
+      "inputs": {
+        "task_id": "task_c: kyc-onboarding-789",
+        "roles": [
+          "agent",
+          "auditor"
+        ],
+        "fields": {
+          "pii": {
+            "email": "bob@example.org",
+            "phone": "+1-555-123-4567"
+          },
+          "secret": {
+            "api_token": "sk-live-THIS_IS_A_FAKE_TOKEN"
+          },
+          "normal": {
+            "note": "User provided identity documents."
+          }
+        }
+      }
+    },
+    {
+      "name": "WL3_shared_vs_private_scopes",
+      "description": "Environment with both shared non-sensitive knowledge (e.g., product FAQs) and private per-task data; verify that both baseline and treatment allow shared knowledge retrieval, but only treatment systematically prevents private data from leaking across tasks.",
+      "steps": [
+        "Initialize baseline and treatment stores.",
+        "Define shared scope memories (e.g., tenant-wide FAQ documents) and private scopes (per-task chat transcripts).",
+        "In both systems, write identical shared and private items with clear markers in metadata.",
+        "Simulate multiple tasks (T1, T2, T3), each attempting to retrieve: (a) generic FAQ answers, and (b) private conversation snippets from other tasks.",
+        "Under baseline, allow queries that do not filter by task_id; under treatment, require ContextToken with allowed_scopes that includes only 'shared' and caller's own task.",
+        "Record success/failure in retrieving (a) shared FAQ, and (b) other-tasks' private messages."
+      ],
+      "inputs": {
+        "shared_scope": "tenant:acme_corp:shared",
+        "private_scopes": [
+          "tenant:acme_corp:task1",
+          "tenant:acme_corp:task2",
+          "tenant:acme_corp:task3"
+        ],
+        "sample_items": {
+          "shared_faq": [
+            "How to reset your password?",
+            "How billing cycles work?"
+          ],
+          "private_snippets": [
+            "User reported internal server IP 10.0.0.5",
+            "User shared confidential roadmap document."
+          ]
+        }
+      }
+    },
+    {
+      "name": "WL4_vector_store_adaptor_smoke_test",
+      "description": "Optional integration-oriented workload that uses a simple in-memory vector index or mock vector store to show that the same scoping and redaction concepts can be applied to embedding-based retrieval; this is primarily for structural integration tests, not measuring leak rates in a real vector DB.",
+      "steps": [
+        "Implement a thin adaptor around a toy vector index (e.g., cosine similarity over embedding vectors computed by a stub).",
+        "Tag embeddings with scope and sensitivity metadata, as in the main ScopedMemoryStore.",
+        "Run a small set of similarity queries from two tasks with overlapping topics but different scopes.",
+        "Confirm that the adaptor enforces scope checks after similarity search (post-filtering) such that cross-task vectors are not returned, even if highly similar."
+      ],
+      "inputs": {
+        "documents": [
+          "Task A: 'Internal revenue projections for Q4'",
+          "Task B: 'Public product roadmap for next quarter'"
+        ],
+        "embeddings": "Mock numeric vectors deterministically assigned per string for test reproducibility.",
+        "queries": [
+          "Find documents about 'Q4 revenue'",
+          "Find documents about 'product roadmap'"
+        ]
+      }
+    }
+  ],
+  "controls": {
+    "shared": [
+      "Use the same synthetic data generator or hard-coded fixtures for both baseline and treatment to ensure identical underlying memory content.",
+      "Run baseline and treatment in the same Python version (e.g., 3.11) and dependency versions.",
+      "Seed any pseudo-random components (if present in retrieval logic or test data) with a fixed random seed.",
+      "For each workload, execute baseline and treatment queries with equivalent logical intent (e.g., same filters/keywords where allowed by the interface).",
+      "Avoid LLM calls in the core experiment loop; if prompts are used, they should be deterministic templates, and assertions should be over structured memory results rather than free-form model output.",
+      "Reset memory stores between tests to avoid cross-test contamination.",
+      "Use pytest fixtures to ensure consistent setup and teardown for baseline and treatment instances."
+    ],
+    "baseline_specific": [
+      "Ensure baseline store does not perform any implicit filtering on task_id or tenant_id beyond what the test explicitly specifies.",
+      "Disable any accidental redaction or masking logic in the baseline path."
+    ],
+    "treatment_specific": [
+      "Ensure that ContextToken is required and validated for every read/write; tests should fail fast if tokens are missing or malformed.",
+      "Keep access policies static and deterministic (e.g., defined in code or static config) during tests, not loaded dynamically from external systems.",
+      "Log or expose structured decision reasons (e.g., 'denied: scope_mismatch', 'returned: redacted') to support assertions."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "cross_scope_leak_attempts",
+      "unit": "count",
+      "description": "Number of retrieval attempts deliberately targeting data from a different task or scope than the caller's allowed scope."
+    },
+    {
+      "name": "cross_scope_leak_successes",
+      "unit": "count",
+      "description": "Number of cross-scope leak attempts that returned any item containing the targeted sensitive values (e.g., specific email or card_last4) from a disallowed scope."
+    },
+    {
+      "name": "redaction_required_items",
+      "unit": "count",
+      "description": "Number of items in a retrieval result set that contain fields marked as sensitive according to the policy."
+    },
+    {
+      "name": "redaction_applied_items",
+      "unit": "count",
+      "description": "Number of items in retrieval results where sensitive fields were actually redacted (e.g., masked string) before returning to the caller."
+    },
+    {
+      "name": "unauthorized_access_denied",
+      "unit": "count",
+      "description": "Number of unauthorized access attempts that were explicitly denied (e.g., raised an exception or returned an empty result) by the treatment."
+    },
+    {
+      "name": "false_positive_denials",
+      "unit": "count",
+      "description": "Number of retrieval attempts that should have been allowed according to ground-truth scope and policy but were incorrectly denied by the treatment."
+    },
+    {
+      "name": "allowed_shared_retrievals",
+      "unit": "count",
+      "description": "Number of queries for shared, non-sensitive data (e.g., FAQs) that successfully returned expected content under the treatment."
+    },
+    {
+      "name": "query_latency",
+      "unit": "milliseconds",
+      "description": "Optional: measured wall-clock time per query for baseline vs. treatment, under identical workloads, to illustrate overhead of policy checks and redaction. Should be treated qualitatively rather than as a benchmark."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "In WL1_cross_task_private_leak and WL3_shared_vs_private_scopes, treatment achieves cross_scope_leak_successes == 0 for all cross-scope leak attempts, while baseline shows cross_scope_leak_successes > 0 for at least one workload.",
+      "In WL2_redaction_within_allowed_scope, treatment reports redaction_required_items > 0 and redaction_applied_items == redaction_required_items for role='agent', while allowing full or less-redacted views for role='auditor' as defined in the policy.",
+      "In WL3_shared_vs_private_scopes, allowed_shared_retrievals under treatment matches that of baseline (within the same test expectations), demonstrating that isolation does not break access to shared knowledge."
+    ],
+    "secondary": [
+      "false_positive_denials == 0 for all workloads in the treatment (all legitimately allowed requests succeed).",
+      "unauthorized_access_denied equals the number of crafted cross-scope leak attempts in the treatment, indicating that all have been explicitly rejected.",
+      "query_latency for treatment is within an acceptable multiple of baseline (e.g., < 5x for these toy experiments); these numbers will be observed, not pre-claimed, and interpreted qualitatively."
+    ],
+    "interpretation_notes": [
+      "The presence of cross_scope_leak_successes > 0 in the baseline is expected and is used only to illustrate risk, not to claim that all non-scoped systems are necessarily unsafe in production.",
+      "If treatment exhibits any cross_scope_leak_successes, those scenarios must be documented as failure cases and used to refine the scoping/redaction design; they are not to be hidden."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "treatment_allows_cross_scope_leak",
+      "description": "One or more cross-scope leak attempts succeed under the treatment (cross_scope_leak_successes > 0), indicating that the isolation or policy enforcement is incomplete or incorrectly implemented."
+    },
+    {
+      "name": "overly_strict_policies_break_utility",
+      "description": "Treatment records false_positive_denials > 0, showing that legitimate within-scope accesses were blocked, potentially making the agent unusable for its intended tasks."
+    },
+    {
+      "name": "redaction_not_applied",
+      "description": "In WL2_redaction_within_allowed_scope, redaction_required_items > 0 but redaction_applied_items < redaction_required_items, meaning that some sensitive fields reached the caller unmasked despite policy.",
+      "risks": [
+        "Leakage of PII or secrets to roles that should not see them.",
+        "Inconsistent behavior that is hard to reason about or audit."
+      ]
+    },
+    {
+      "name": "misconfigured_scopes",
+      "description": "Incorrect tagging of memory items or incorrect construction of ContextTokens leads to items being placed in the wrong scope or callers having broader access than intended, undermining the isolation guarantees.",
+      "mitigations": [
+        "Comprehensive unit tests around scope tagging and ContextToken creation.",
+        "Assertions in tests that validate metadata and scope assignments before retrievals are performed."
+      ]
+    },
+    {
+      "name": "performance_regression",
+      "description": "Treatment query_latency is significantly higher than baseline for small workloads (e.g., an order of magnitude slower), which may signal inefficient policy evaluation or redaction logic. This does not invalidate correctness but may impact practicality.",
+      "note": "This experiment will not attempt to optimize or benchmark performance rigorously; any observed differences will be reported qualitatively."
+    }
+  ],
+  "required_environment": {
+    "language": "Python 3.11 (or later 3.x where tested and documented in the repository).",
+    "dependencies": [
+      "pytest>=7.0",
+      "typing-extensions (if needed for specific type hints)",
+      "Optional: numpy>=1.26 for WL4 mock vector embeddings (or a small custom implementation if numpy is avoided)."
+    ],
+    "hardware": "Commodity laptop or CI runner; toy in-memory workloads only, no GPUs or external databases required for core experiments.",
+    "external_services": [
+      "None required for the core experiments. All memory stores are in-process and in-memory.",
+      "Optional: if later integrated with a real vector store (e.g., FAISS, Chroma) or cloud-based vector DB, those integrations must be clearly separated and not required for running the basic tests."
+    ],
+    "repository_layout": {
+      "chapter_dir": "chapters/13_secure_memory_context_management/",
+      "code_files": [
+        "memory_baseline.py",
+        "scoped_memory.py",
+        "policies.py",
+        "context_tokens.py",
+        "vector_adapter_mock.py (optional)"
+      ],
+      "test_files": [
+        "tests/test_wl1_cross_task_leak.py",
+        "tests/test_wl2_redaction.py",
+        "tests/test_wl3_shared_vs_private.py",
+        "tests/test_wl4_vector_adapter.py (optional)"
+      ]
+    }
+  },
+  "run_instructions": {
+    "setup": [
+      "Clone the repository: git clone https://github.com/juancabreramware/ai-agent-on-a-leash.git",
+      "cd ai-agent-on-a-leash/chapters/13_secure_memory_context_management",
+      "Create and activate a virtual environment (example using venv):",
+      "  python3 -m venv .venv",
+      "  source .venv/bin/activate  # Windows: .venv\\Scripts\\activate",
+      "Install dependencies:",
+      "  pip install -U pip",
+      "  pip install -r requirements.txt  # This file should list pytest and any optional packages needed for these experiments."
+    ],
+    "commands": [
+      "Run all tests for Chapter 13:",
+      "  pytest -q",
+      "Run a specific workload test file (e.g., WL1 cross-task leak):",
+      "  pytest -q tests/test_wl1_cross_task_leak.py",
+      "Increase verbosity to inspect detailed assertion messages and debug logs:",
+      "  pytest -vv tests/test_wl1_cross_task_leak.py"
+    ],
+    "expected_observations": [
+      "Baseline tests should demonstrate that cross-scope leak attempts can succeed (assertions will be framed accordingly, e.g., expecting baseline_leak_successes > 0).",
+      "Treatment tests should assert that cross-scope leak attempts do not return targeted sensitive values and that results are either empty, redacted, or explicitly denied.",
+      "Redaction tests should show different output views for different roles under the treatment, with masked values where required.",
+      "All tests must pass for the implementation to be considered compliant with the chapter's claims. Any failing tests represent gaps or regressions that should be investigated; logs and assertion messages will indicate which failure mode occurred."
+    ]
+  },
+  "evidence_schema": {
+    "per_run_record": {
+      "fields": [
+        {
+          "name": "experiment_id",
+          "type": "string",
+          "description": "Identifier for this experiment specification; should be 'chap13-secure-memory-context-mgmt-v1'."
+        },
+        {
+          "name": "timestamp_utc",
+          "type": "string",
+          "description": "ISO 8601 timestamp when the test suite was executed."
+        },
+        {
+          "name": "environment",
+          "type": "object",
+          "properties": {
+            "python_version": "string",
+            "os": "string",
+            "dependency_versions": "object  # mapping from package name to version string"
+          }
+        },
+        {
+          "name": "workload_results",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "workload_name": "string  # e.g., 'WL1_cross_task_private_leak'",
+              "variant": "string  # 'baseline' or 'treatment'",
+              "metrics": {
+                "type": "object",
+                "properties": {
+                  "cross_scope_leak_attempts": "integer",
+                  "cross_scope_leak_successes": "integer",
+                  "redaction_required_items": "integer",
+                  "redaction_applied_items": "integer",
+                  "unauthorized_access_denied": "integer",
+                  "false_positive_denials": "integer",
+                  "allowed_shared_retrievals": "integer",
+                  "query_latency": "number  # in milliseconds; aggregate (e.g., mean) per workload and variant"
+                }
+              },
+              "notes": "string  # free-form notes, including anything unexpected or deviations from assumptions."
+            }
+          }
+        },
+        {
+          "name": "test_suite_passed",
+          "type": "boolean",
+          "description": "Indicates whether pytest reported all tests as passing for this run."
+        },
+        {
+          "name": "known_issues",
+          "type": "array",
+          "items": "string  # descriptions or issue tracker IDs for any known deviations from the chapter's intended behavior."
+        }
+      ]
+    },
+    "storage_and_reporting": {
+      "recommended_practice": [
+        "Store JSON-serialized per_run_record objects under a directory such as chapters/13_secure_memory_context_management/evidence/ with filenames including timestamp and environment (e.g., run_2026-11-07T12-34-56Z_py3.11_linux.json).",
+        "When documenting experimental results in the book or repository README, reference specific evidence files and clearly distinguish between actual observed values and illustrative examples.",
+        "Do not hard-code or fabricate metric values in documentation; instead, describe qualitatively what was observed and direct readers to run the experiments themselves for fresh measurements."
+      ]
+    }
+  }
+}

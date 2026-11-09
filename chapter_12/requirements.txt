@@ -1,0 +1,2 @@
+# No runtime dependencies beyond the Python 3.11+ standard library.
+# Tests use the built-in unittest framework.

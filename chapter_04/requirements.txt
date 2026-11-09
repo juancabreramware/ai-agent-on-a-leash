@@ -1,0 +1,4 @@
+# Runtime dependencies: none (standard library only).
+# This file exists to satisfy tooling that expects a requirements.txt.
+# For development or CI, you may add tools like pytest, but the core
+# experiment code and tests in this sandbox rely only on the stdlib.

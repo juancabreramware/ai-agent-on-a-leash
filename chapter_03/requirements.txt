@@ -1,0 +1,2 @@
+# No runtime dependencies; standard library only.
+# Tests use unittest from the standard library.

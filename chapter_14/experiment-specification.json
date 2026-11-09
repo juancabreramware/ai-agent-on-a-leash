@@ -1,0 +1,299 @@
+{
+  "experiment_id": "chap14-unsafe-recovery-01",
+  "hypothesis": "An agent orchestrator that uses explicit checkpoints, integrity-checked snapshots, and forensic logging can reliably detect and recover from injected unsafe state corruptions with bounded data loss, whereas a baseline orchestrator without these mechanisms will either miss corruptions (silent failure) or propagate them, leading to inconsistent final state and unverifiable history.",
+  "baseline": {
+    "description": "A simple agent-driven task executor that applies state mutations directly to an in-memory key-value store without checkpoints, integrity checks, or structured recovery. The orchestrator executes a sequence of actions (some benign, some intentionally unsafe) and commits every mutation immediately. Logging is minimal (e.g., only start/end messages) and does not capture per-step inputs, outputs, or diffs. There is no automatic detection of corruption or rollback capability.",
+    "implementation_outline": {
+      "module": "chapter14/baseline_orchestrator.py",
+      "key_components": [
+        "InMemoryStore: Simple dict-like store with no versioning or checksums.",
+        "BaselineAgent: Simulated agent that returns actions (\"write\", \"delete\", \"transfer\", etc.) given a task and current state.",
+        "UnsafeActionInjector: Optional component (used only by experiments) that can inject a corruption action into the action sequence (e.g., overwrite balance with a negative value or zero out a record).",
+        "BaselineOrchestrator: Executes agent actions sequentially against InMemoryStore, committing each mutation directly; minimal logging using Python's logging module or print statements."
+      ],
+      "data_model": "A toy ledger with accounts and balances, represented as a dict[str, int], plus a few auxiliary keys to simulate a business domain (e.g., 'last_run_id', 'status')."
+    }
+  },
+  "treatment": {
+    "description": "An incident-ready orchestrator that wraps the same agent and store with: (1) periodic and pre-/post-critical-step checkpoints, (2) integrity-checked snapshots (e.g., hashes of serialized state), (3) forensic logging of all planned and applied actions, (4) detection logic that validates state invariants and snapshot integrity, and (5) a recovery manager that can rollback to the last known-good checkpoint and re-run or quarantine the workflow.",
+    "implementation_outline": {
+      "module": "chapter14/recovery_orchestrator.py",
+      "key_components": [
+        "VersionedStore: Decorator around the baseline InMemoryStore that can create snapshots (full copy or diff), compute and store checksums (e.g., SHA-256 of serialized state), and tag snapshots with metadata (timestamp, reason, run_id, step_id).",
+        "InvariantsEngine: Encapsulates domain-specific safety checks for the ledger (e.g., balances are non-negative, total sum remains constant within a run, required keys exist, no NaN/None in balances).",
+        "ForensicLogger: Structured logger writing JSONL records including run_id, step_id, action, before_state_digest, after_state_digest, invariant_results, and any detected anomalies.",
+        "RecoveryManager: Coordinates detection and recovery: on invariant violation or checksum mismatch, it marks the run as unsafe, selects a rollback snapshot, restores VersionedStore to that state, persists an incident record, and optionally replays non-unsafe steps or aborts.",
+        "RecoveryOrchestrator: Orchestrator that executes the same agent actions as baseline but wraps each step with: snapshotting (according to a policy, e.g., every N steps and before/after high-risk operations), invariants evaluation, snapshot verification, and callouts to RecoveryManager on anomalies."
+      ],
+      "data_model": "Same toy ledger as baseline, but each checkpoint is stored as a serialized blob with a checksum and metadata. Forensic logs and incident records are separate JSONL or in-memory lists written by ForensicLogger."
+    }
+  },
+  "workloads": [
+    {
+      "name": "WL1_nominal_no_corruption",
+      "description": "Nominal workflow with a sequence of benign ledger updates (e.g., transfers between accounts, small deposits/withdrawals) that all respect invariants. Used to verify that both baseline and treatment produce identical final state under normal conditions and to measure baseline overhead of checkpointing and logging.",
+      "steps_profile": {
+        "num_actions": 20,
+        "actions_mix": [
+          "transfer between accounts",
+          "increment/decrement balances within allowed bounds",
+          "no explicit unsafe or corrupting actions"
+        ]
+      },
+      "expected_behavior_baseline": "Completes successfully with consistent ledger state (all balances non-negative, total sum preserved where required). No explicit incident notion.",
+      "expected_behavior_treatment": "Completes successfully with no detected incidents. RecoveryManager is not triggered. Forensic logs and checkpoints are written according to policy; invariants always pass."
+    },
+    {
+      "name": "WL2_immediate_corruption_after_safe_start",
+      "description": "Workflow where some initial actions are safe, followed by a single injected corruption action that violates invariants (e.g., sets a balance negative or breaks total-sum conservation). Exercise detection of a clear-cut unsafe state soon after a known-good checkpoint.",
+      "steps_profile": {
+        "num_actions": 10,
+        "pattern": [
+          "3 benign transfer actions",
+          "1 injected corruption action (e.g., 'set balance[A] = -1000')",
+          "remaining 6 actions are benign but will operate on corrupted state if not contained"
+        ]
+      },
+      "expected_behavior_baseline": "All actions, including corrupting one, are applied. Subsequent benign actions operate over corrupted state. No detection or rollback occurs. Final state violates invariants.",
+      "expected_behavior_treatment": "InvariantsEngine detects violation immediately after the corruption step (or shortly thereafter, depending on policy). RecoveryManager rolls back to last good checkpoint, aborts or quarantines the run, and records incident details (offending step, invariant errors, checkpoint used). Final exposed ledger to callers is the last known-good state."
+    },
+    {
+      "name": "WL3_late_corruption_after_long_run",
+      "description": "Longer workflow where corruption is injected late (e.g., near the end of 100 actions), stressing snapshot frequency, detection coverage, and potential data loss window between last checkpoint and corruption.",
+      "steps_profile": {
+        "num_actions": 100,
+        "pattern": [
+          "80 benign actions",
+          "1 corruption action injecting a latent risk (e.g., silently zero out an account that is rarely read)",
+          "19 more benign actions"
+        ]
+      },
+      "expected_behavior_baseline": "Corruption propagates. Depending on when invariants are evaluated (if at all in user tests), issue may remain latent. Final state is inconsistent, but baseline orchestrator does not flag or remediate.",
+      "expected_behavior_treatment": "InvariantsEngine or checksum verification detects corruption at or shortly after the corrupting step. RecoveryManager rolls back to a checkpoint within a bounded number of steps before the corrupting action. Some recent benign actions may need to be replayed or discarded, illustrating bounded data loss and replay tradeoffs."
+    },
+    {
+      "name": "WL4_hidden_side_effect_external_view",
+      "description": "Simulated hidden side effect where the agent writes inconsistent data to a 'shadow' key or external-view-like structure (e.g., summary index) that diverges from the primary ledger. This tests whether forensic logging and invariants that cross-check derived state can identify divergence.",
+      "steps_profile": {
+        "num_actions": 30,
+        "pattern": [
+          "benign actions that update both ledger and 'summary' index consistently",
+          "corruption action that writes incorrect summary (e.g., wrong total) without touching ledger",
+          "further benign actions"
+        ]
+      },
+      "expected_behavior_baseline": "Summary index and ledger diverge permanently; no detection because baseline does not perform cross-check invariants or track snapshots for the summary.",
+      "expected_behavior_treatment": "InvariantsEngine periodically compares ledger-derived totals with stored summary index. Divergence triggers incident detection and rollback or targeted recomputation of summary from last good ledger snapshot."
+    }
+  ],
+  "controls": {
+    "shared_components": [
+      "Same Agent behavior: Both baseline and treatment use an identical simulated agent policy (deterministic or seeded RNG) to generate the sequence of actions for each workload, so differences in outcomes are attributable to orchestration and recovery mechanisms, not agent logic.",
+      "Same Initial State: For each run of a given workload, baseline and treatment start from an identical initial ledger and summary index (using a fixed fixture or reset function).",
+      "Determinism: All randomness (e.g., in agent decision or corruption injection timing) must be controlled via fixed random seeds passed to the agent and UnsafeActionInjector, so that baseline and treatment see the same corruption pattern.",
+      "Invariant Definitions: The invariants and corruption definitions used for detection are specified once (e.g., in a shared invariants.py module) and referenced by both experiments, although only the treatment orchestrator uses them for enforcement; baseline may reuse them in tests to evaluate final state offline.",
+      "Execution Environment: Both baseline and treatment run under the same Python version, OS, and dependency versions. Resource limits and CPU conditions should be similar for fair overhead comparison.",
+      "Logging Level: Logging configuration is comparable (e.g., INFO) across runs to avoid logging-level-induced performance artifacts; treatment will naturally log more structured data but should not enable debug-level tracing unless baseline also does."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "detection_rate",
+      "unit": "proportion_of_corruption_events_detected",
+      "description": "For workloads that inject corruption (WL2, WL3, WL4), the fraction of runs where the orchestrator flagged an unsafe state before workflow completion. For baseline this is expected to be 0, but experiments must compute it from actual behavior (e.g., detection via explicit invariant checks; baseline will have none)."
+    },
+    {
+      "name": "false_positive_rate",
+      "unit": "proportion_of_nominal_runs_flagged_unsafe",
+      "description": "Fraction of WL1 runs (no corruption) where the orchestrator incorrectly flags an unsafe state or triggers rollback."
+    },
+    {
+      "name": "mean_recovery_time",
+      "unit": "seconds",
+      "description": "For treatment in corrupted workloads, elapsed wall-clock time between first detection of an unsafe state and completion of rollback/recovery (either run aborted safely or resumed to a safe state). Baseline does not implement recovery; this metric will be recorded as N/A and should not be fabricated."
+    },
+    {
+      "name": "max_data_loss_window",
+      "unit": "actions",
+      "description": "For treatment: the maximum number of successfully applied benign actions (mutations) that are lost when rolling back from the detected unsafe state to the nearest safe checkpoint. This illustrates the tradeoff between checkpoint frequency and potential data loss."
+    },
+    {
+      "name": "final_state_invariant_violations",
+      "unit": "count_per_run",
+      "description": "Number of invariant violations measured at the end of each run when evaluating the store offline (for both baseline and treatment) using the shared InvariantsEngine. This is primarily to quantify silent corruption for baseline vs. bounded corruption/recovery for treatment."
+    },
+    {
+      "name": "orchestration_overhead",
+      "unit": "seconds_per_run",
+      "description": "Difference in wall-clock execution time between baseline and treatment orchestrators under the same workload and environment, primarily due to snapshot creation, checksum computation, invariant evaluation, and logging."
+    },
+    {
+      "name": "forensic_log_coverage",
+      "unit": "proportion_of_steps_logged",
+      "description": "For treatment: ratio of executed actions that have a corresponding structured forensic log entry linking run_id, step_id, before/after digests, and action metadata. This measures the completeness of incident-ready logging."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "Under corrupted workloads (WL2\u2013WL4), the treatment orchestrator detects and flags 100% of intentionally injected corruption events across test runs, while the baseline orchestrator detects 0% (no explicit mechanism). This must be measured empirically; do not assume perfect detection until experiments confirm it.",
+      "For workloads with no corruption (WL1), the treatment orchestrator\u2019s false_positive_rate remains below 1% across repeated runs (ideally 0 in deterministic tests), demonstrating that invariants and checks do not spuriously trigger incident flows under normal conditions.",
+      "For corrupted workloads, the treatment orchestrator ensures that final_state_invariant_violations at end of run are zero (post-recovery), while baseline shows at least one violation in each corrupted run, demonstrating effective containment and rollback.",
+      "For corrupted workloads, max_data_loss_window remains below a configured threshold (e.g., <= 5 actions) determined by checkpoint frequency, and the measured values match the theoretical upper bound specified in the recovery policy."
+    ],
+    "secondary": [
+      "For WL1 nominal workloads, baseline and treatment produce identical final ledger and summary index states when evaluated by the offline invariants checker, confirming that recovery instrumentation does not alter behavior in non-incident cases.",
+      "orchestration_overhead for treatment relative to baseline is within an acceptable bound defined by the engineer (e.g., less than 2x for the toy workload), with actual overhead clearly reported from measurements rather than assumed.",
+      "forensic_log_coverage for treatment is 1.0 (every executed step has a corresponding structured forensic log entry), ensuring high-quality data for postmortems."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "undetected_corruption",
+      "description": "A corrupted run in WL2\u2013WL4 completes without the treatment orchestrator raising an incident, while offline invariants still detect final_state_invariant_violations. Indicates insufficient or incorrectly implemented detection logic."
+    },
+    {
+      "name": "misapplied_recovery",
+      "description": "RecoveryManager triggers but restores to a snapshot that is itself unsafe (e.g., already corrupted or missing data), or replays steps in a way that reintroduces the corruption. Final state remains inconsistent despite a recovery attempt."
+    },
+    {
+      "name": "excessive_data_loss",
+      "description": "Measured max_data_loss_window exceeds the preconfigured policy threshold (e.g., more than 5 benign actions lost) due to infrequent checkpoints or bugs in checkpoint-selection logic."
+    },
+    {
+      "name": "high_false_positive_rate",
+      "description": "Treatment orchestrator flags incidents in WL1 nominal runs frequently, indicating over-sensitive invariants or unstable snapshot integrity checks; leads to unnecessary rollbacks and operational noise."
+    },
+    {
+      "name": "logging_gaps",
+      "description": "forensic_log_coverage less than 1.0 for treatment runs, making it impossible to reconstruct full action history for incident analysis; some steps are missing from logs or have incomplete metadata."
+    },
+    {
+      "name": "unbounded_overhead",
+      "description": "orchestration_overhead for the treatment grows super-linearly with number of actions (e.g., due to full deep copy snapshots at every step) without documentation of this tradeoff or mitigation strategy."
+    }
+  ],
+  "required_environment": {
+    "software": {
+      "python_version": "Python 3.10 or later",
+      "dependencies": [
+        "pytest>=7.0.0",
+        "typing-extensions>=4.0.0 (if needed for older Python minor versions)",
+        "any additional dev dependencies used for convenience, such as 'rich' or 'loguru', must be clearly listed but are optional; core experiments should only require the standard library plus pytest."
+      ]
+    },
+    "hardware": {
+      "cpu": "Any modern x86_64 or ARM CPU; experiments are CPU-light.",
+      "memory": "At least 512 MB RAM (toy in-memory snapshots).",
+      "storage": "A few MB free disk space for logs and optional snapshot artifacts."
+    },
+    "os": [
+      "Linux",
+      "macOS",
+      "Windows"
+    ],
+    "repository_layout": {
+      "root": "ai-agent-on-a-leash/",
+      "chapter_directory": "ai-agent-on-a-leash/chapter14/",
+      "suggested_files": [
+        "chapter14/baseline_orchestrator.py",
+        "chapter14/recovery_orchestrator.py",
+        "chapter14/invariants.py",
+        "chapter14/store.py",
+        "chapter14/forensic_logging.py",
+        "chapter14/workloads.py",
+        "chapter14/test_recovery_experiments.py",
+        "chapter14/README.md"
+      ]
+    }
+  },
+  "run_instructions": {
+    "setup": [
+      "Clone the repository: `git clone https://github.com/juancabreramware/ai-agent-on-a-leash.git`",
+      "Change to the repo directory: `cd ai-agent-on-a-leash`",
+      "Create and activate a virtual environment (optional but recommended):",
+      "  `python -m venv .venv`",
+      "  On Unix/macOS: `source .venv/bin/activate`",
+      "  On Windows: `.venv\\Scripts\\activate`",
+      "Install dependencies (minimal): `pip install -r requirements.txt` or, if not provided, at least `pip install pytest`."
+    ],
+    "experiment_execution": [
+      "From the repository root, run the chapter 14 tests:",
+      "  `pytest -q chapter14/test_recovery_experiments.py`",
+      "The test module should contain parametrized tests that:",
+      "  - Execute each workload (WL1\u2013WL4) against both baseline and treatment orchestrators.",
+      "  - Collect metrics such as final_state_invariant_violations, detection events, recovery timings, and data_loss_window.",
+      "  - Assert core success criteria where appropriate (e.g., treatment detects all corruptions; baseline final state is inconsistent under corrupted workloads)."
+    ],
+    "direct_script_usage": [
+      "Optionally, provide small CLI entrypoints to run single workloads manually for exploration:",
+      "  `python -m chapter14.baseline_orchestrator --workload WL2_immediate_corruption_after_safe_start --seed 42`",
+      "  `python -m chapter14.recovery_orchestrator --workload WL2_immediate_corruption_after_safe_start --seed 42`",
+      "These commands should print a concise summary including detection status, any rollback performed, and final invariant evaluation, while writing detailed forensic logs to `chapter14/logs/` in JSONL format."
+    ],
+    "result_inspection": [
+      "Inspect pytest output for pass/fail status and any printed metric summaries.",
+      "Optionally, inspect structured logs (e.g., `chapter14/logs/recovery_run_WL2_seed42.jsonl`) to see per-step action traces and recovery decisions.",
+      "Do not assume specific numeric timings or overhead a priori; measure and report them based on your own environment if needed for further analysis."
+    ]
+  },
+  "evidence_schema": {
+    "run_record": {
+      "run_id": "string, unique identifier for a particular experiment run (e.g., 'WL2_treatment_seed42')",
+      "orchestrator_type": "string, either 'baseline' or 'treatment'",
+      "workload_name": "string, one of ['WL1_nominal_no_corruption', 'WL2_immediate_corruption_after_safe_start', 'WL3_late_corruption_after_long_run', 'WL4_hidden_side_effect_external_view']",
+      "seed": "integer, random seed used for agent and corruption injection",
+      "start_time_utc": "ISO 8601 timestamp",
+      "end_time_utc": "ISO 8601 timestamp",
+      "metrics": {
+        "detection_rate": "float or null, computed across multiple runs; for a single run this can be represented as 0.0 or 1.0 indicating whether corruption was detected. For baseline on non-corrupting workloads may be null.",
+        "false_positive": "boolean, true if an incident was raised in a workload that injected no corruption (e.g., WL1).",
+        "mean_recovery_time": "float or null, seconds between detection and end of recovery for this run (null for baseline or runs with no incident).",
+        "data_loss_window": "integer or null, number of benign actions lost during rollback for this run (null for baseline or runs with no rollback).",
+        "final_state_invariant_violations": "integer, count of invariant violations detected by offline invariants checker at run completion.",
+        "orchestration_overhead": "float or null, seconds for this run minus a reference baseline time for the same workload and environment (null if not computed in that execution).",
+        "forensic_log_coverage": "float or null, fraction of executed steps with a corresponding forensic log entry (treatment only)."
+      },
+      "incident": {
+        "incident_detected": "boolean, whether the orchestrator flagged an unsafe state in this run",
+        "detection_step_id": "integer or null, index of the step at which the anomaly was detected (0-based or 1-based, but consistent across logs)",
+        "rollback_checkpoint_id": "string or null, identifier of the checkpoint to which the store was rolled back",
+        "recovery_outcome": "string or null, one of ['no_incident', 'recovered_and_resumed', 'recovered_and_aborted', 'failed_recovery']"
+      }
+    },
+    "step_record": {
+      "run_id": "string, foreign key linking to run_record",
+      "step_id": "integer, sequential identifier of the step within a run",
+      "timestamp_utc": "ISO 8601 timestamp",
+      "action": {
+        "type": "string, e.g., 'transfer', 'deposit', 'withdraw', 'corruption', 'summary_update'",
+        "params": "object, action-specific parameters (account ids, amounts, etc.)"
+      },
+      "state_before_digest": "string, checksum (e.g., SHA-256) of serialized state before executing the action (treatment only, or optional for baseline if implemented)",
+      "state_after_digest": "string, checksum of state after executing the action",
+      "invariants_evaluated": "boolean, whether invariants were evaluated at this step",
+      "invariants_status": "string or null, one of ['pass', 'fail'] if evaluated",
+      "invariants_errors": "array of strings or null, listing names/descriptions of violated invariants when status == 'fail'",
+      "checkpoint_created": "boolean, whether a snapshot/checkpoint was created at this step",
+      "checkpoint_id": "string or null, identifier of the created checkpoint"
+    },
+    "aggregation": {
+      "per_workload_summary": {
+        "workload_name": "string",
+        "orchestrator_type": "string",
+        "num_runs": "integer, number of repeated runs aggregated",
+        "mean_final_state_invariant_violations": "float",
+        "detection_rate": "float, runs with incident_detected / num_runs",
+        "false_positive_rate": "float, for workloads without injected corruption",
+        "mean_mean_recovery_time": "float or null, average of mean_recovery_time over runs with incidents",
+        "mean_data_loss_window": "float or null",
+        "mean_orchestration_overhead": "float or null",
+        "mean_forensic_log_coverage": "float or null"
+      }
+    },
+    "notes": [
+      "No numeric values should be pre-populated in this schema. It defines the structure into which real experimental results are to be recorded after running the code.",
+      "If certain metrics are not applicable for a run (e.g., recovery time for baseline), they should be stored as null and clearly documented rather than fabricated.",
+      "Engineers can extend this schema with additional fields (e.g., environment metadata, git commit hash) as needed for robust reproducibility."
+    ]
+  }
+}

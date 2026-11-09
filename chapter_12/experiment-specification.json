@@ -1,0 +1,438 @@
+{
+  "experiment_id": "exp-12-continuous-monitoring-circuit-breaker-shutdown",
+  "hypothesis": "A monitored agent wrapped with circuit breaker and emergency shutdown logic will automatically halt further actions within one control interval when observable metrics (error rate and latency) or explicit policy-violation signals exceed configured thresholds, while an unprotected baseline agent will continue executing and compounding failures under the same injected-fault workloads.",
+  "baseline": {
+    "description": "Unprotected agent loop without monitoring, circuit breaker, or shutdown hooks. The agent executes tasks sequentially, directly calling tools and emitting metrics/logs only for debugging. There is no automatic response to anomalies: injected faults, error spikes, or policy violations do not alter the agent\u2019s behavior.",
+    "core_components": [
+      "SimpleAgent: deterministic Python class that processes a stream of tasks and calls a ToolRunner to perform operations.",
+      "ToolRunner: executes simulated tools (e.g., success, slow, failing, policy-violating) according to the task definition, without any wrapping or interception.",
+      "TaskSource: deterministic generator of tasks for workloads (e.g., mix of nominal, slow, and failing tasks)."
+    ],
+    "behavior_characteristics": [
+      "No metric-based control: metrics (if any) are not used to change behavior.",
+      "No circuit breaker: repeated failures or latency spikes do not pause or stop execution.",
+      "No killswitch: policy violations are logged but do not prevent subsequent actions.",
+      "Execution continues until the task list is exhausted or a hard exception crashes the process."
+    ]
+  },
+  "treatment": {
+    "description": "Monitored agent with metric collection, anomaly detection, circuit breaker logic, and an emergency shutdown path. The agent is behaviorally identical to the baseline under nominal conditions but is wrapped in an observability and control layer that can halt task execution when thresholds are breached.",
+    "core_components": [
+      "MonitoredAgent: thin wrapper around SimpleAgent that routes all tool invocations and high-level decisions through a Monitor and CircuitBreaker before allowing execution.",
+      "Monitor: collects per-task metrics (latency, success/failure, error types, policy_violation flags) and maintains rolling windows (e.g., last N tasks) for aggregate statistics.",
+      "CircuitBreaker: state machine (CLOSED \u2192 OPEN \u2192 HALF_OPEN) that evaluates metrics after each task and decides whether to allow or block further actions. Triggers on conditions such as error rate above threshold, latency threshold exceeded, or any policy_violation signal.",
+      "EmergencyShutdownManager: once activated (e.g., on critical policy_violation or sustained OPEN state), it transitions the system into a TERMINATED state and refuses all further agent actions until manual reset.",
+      "ControlHooks: explicit hooks in the orchestration loop that check breaker and shutdown states before each task execution."
+    ],
+    "control_logic_summary": [
+      "Metrics are updated after each tool invocation.",
+      "After metric update, CircuitBreaker.evaluate() is called.",
+      "If in OPEN or TERMINATED state, the next iteration checks breaker state and either skips execution or raises a controlled ShutdownException.",
+      "Policy violation tasks cause an immediate OPEN state and activation of emergency shutdown."
+    ]
+  },
+  "workloads": [
+    {
+      "name": "WL1_nominal_low_error",
+      "description": "Nominal workload with mostly successful, fast tasks and rare, isolated failures; intended to verify that the circuit breaker stays CLOSED and the monitored agent behaves identically to the baseline under normal conditions.",
+      "task_profile": {
+        "total_tasks": 50,
+        "composition": {
+          "success_task_ratio": 0.9,
+          "slow_task_ratio": 0.1,
+          "failing_task_ratio": 0.0,
+          "policy_violation_task_ratio": 0.0
+        },
+        "timing_characteristics": {
+          "success_task_latency_range_ms": [
+            5,
+            20
+          ],
+          "slow_task_latency_range_ms": [
+            80,
+            150
+          ]
+        }
+      },
+      "expected_conditions": [
+        "Aggregate error rate < 1%.",
+        "No explicit policy_violation flags.",
+        "Average latency below configured thresholds.",
+        "Treatment circuit breaker remains in CLOSED state; no shutdowns."
+      ]
+    },
+    {
+      "name": "WL2_error_spike",
+      "description": "Workload with an induced burst of consecutive failing tasks around the midpoint to simulate a sudden spike in error rate; used to test that the breaker transitions to OPEN and halts further execution while baseline continues.",
+      "task_profile": {
+        "total_tasks": 100,
+        "phases": [
+          {
+            "name": "warmup",
+            "num_tasks": 30,
+            "success_task_ratio": 1.0,
+            "slow_task_ratio": 0.0,
+            "failing_task_ratio": 0.0,
+            "policy_violation_task_ratio": 0.0
+          },
+          {
+            "name": "error_spike",
+            "num_tasks": 20,
+            "success_task_ratio": 0.0,
+            "slow_task_ratio": 0.0,
+            "failing_task_ratio": 1.0,
+            "policy_violation_task_ratio": 0.0
+          },
+          {
+            "name": "post_spike",
+            "num_tasks": 50,
+            "success_task_ratio": 1.0,
+            "slow_task_ratio": 0.0,
+            "failing_task_ratio": 0.0,
+            "policy_violation_task_ratio": 0.0
+          }
+        ],
+        "timing_characteristics": {
+          "failing_task_latency_range_ms": [
+            5,
+            20
+          ]
+        }
+      },
+      "expected_conditions": [
+        "Error rate in error_spike phase approaches 100%.",
+        "Configured breaker threshold: e.g., error_rate_window_20 > 0.5.",
+        "Treatment agent stops executing further tasks at or shortly after threshold breach (within one control loop).",
+        "Baseline agent executes all 100 tasks regardless of errors."
+      ]
+    },
+    {
+      "name": "WL3_latency_surge",
+      "description": "Workload that induces a sustained latency surge using slow tasks to trigger the circuit breaker\u2019s latency-based opening condition without elevated error rate.",
+      "task_profile": {
+        "total_tasks": 80,
+        "phases": [
+          {
+            "name": "baseline_latency",
+            "num_tasks": 30,
+            "success_task_ratio": 1.0,
+            "slow_task_ratio": 0.0,
+            "failing_task_ratio": 0.0,
+            "policy_violation_task_ratio": 0.0
+          },
+          {
+            "name": "latency_surge",
+            "num_tasks": 30,
+            "success_task_ratio": 0.0,
+            "slow_task_ratio": 1.0,
+            "failing_task_ratio": 0.0,
+            "policy_violation_task_ratio": 0.0
+          },
+          {
+            "name": "post_surge",
+            "num_tasks": 20,
+            "success_task_ratio": 1.0,
+            "slow_task_ratio": 0.0,
+            "failing_task_ratio": 0.0,
+            "policy_violation_task_ratio": 0.0
+          }
+        ],
+        "timing_characteristics": {
+          "slow_task_latency_range_ms": [
+            300,
+            500
+          ]
+        }
+      },
+      "expected_conditions": [
+        "Breaker latency threshold: e.g., rolling_mean_latency_window_10 > 250 ms.",
+        "Treatment agent opens circuit during latency_surge phase and halts or greatly reduces executed tasks thereafter.",
+        "Baseline agent completes all 80 tasks despite high latency."
+      ]
+    },
+    {
+      "name": "WL4_immediate_policy_violation",
+      "description": "Workload including a specific policy-violating task (e.g., labeled as forbidden_operation) to verify that the emergency shutdown path triggers even if error rate and latency are otherwise normal.",
+      "task_profile": {
+        "total_tasks": 20,
+        "task_sequence": [
+          "success",
+          "success",
+          "policy_violation",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success",
+          "success"
+        ],
+        "semantics": {
+          "policy_violation_task": "Simulated tool that flags policy_violation=True without raising a technical error (e.g., attempt to access disallowed resource)."
+        }
+      },
+      "expected_conditions": [
+        "Monitor receives at least one event with policy_violation=True.",
+        "CircuitBreaker immediately transitions to OPEN and EmergencyShutdownManager enters TERMINATED state upon first policy_violation.",
+        "Treatment agent executes no tasks after the violating one.",
+        "Baseline agent continues executing remaining tasks."
+      ]
+    }
+  ],
+  "controls": {
+    "randomness_and_determinism": [
+      "Use a fixed random seed (e.g., PYTHONHASHSEED and random.seed) for all stochastic elements in task ordering and latency simulation.",
+      "Avoid dependence on actual wall-clock latency where possible; instead, simulate latency by explicitly sleeping for deterministic durations derived from the seed or by computing dummy workloads.",
+      "Ensure that for each workload, the exact same task sequence is passed to both baseline and treatment agents."
+    ],
+    "experimental_design": [
+      "Run baseline and treatment in the same Python process sequentially for each workload to minimize environmental differences, or in separate processes with identical environment configuration.",
+      "Do not modify agent business logic between baseline and treatment; only add monitoring and control wrappers. Tool behavior and task semantics must remain identical.",
+      "Isolate experiments for chapter 12 in a dedicated directory (e.g., `chapter_12_circuit_breakers/`) with self-contained dependencies."
+    ],
+    "measurement_and_logging": [
+      "Use a shared MetricsRecorder interface for both baseline and treatment to ensure comparable metric collection (baseline will record but not act on metrics).",
+      "Emit structured logs (e.g., JSON lines) for each task execution, including: task_id, task_type, start_time, end_time, latency_ms, success, error_type, policy_violation, breaker_state_before, breaker_state_after, shutdown_state.",
+      "Ensure timestamps are captured using a monotonic clock where relevant for relative latency measurement."
+    ],
+    "resource_isolation": [
+      "Run in a controlled local environment without external API calls; all tools should be simulated in-process functions that do not perform filesystem or network side effects.",
+      "Limit task counts and sleep durations so that total experiment runtime is practical (< 1\u20132 minutes) on a typical developer laptop."
+    ],
+    "validation_and_sanity_checks": [
+      "Include pytest tests that assert invariants: e.g., error rate calculations, windowing logic, correct state transitions in CircuitBreaker, and that treatment stops executing tasks once shutdown is active.",
+      "Verify that for WL1_nominal_low_error, the number of executed tasks is equal between baseline and treatment.",
+      "Use separate test cases to cover half-open behavior if implemented (e.g., limited retries after cooldown)."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "tasks_executed",
+      "unit": "count",
+      "description": "Number of tasks actually executed by the agent (baseline or treatment) for a given workload. Used to detect early termination due to circuit breaker or shutdown."
+    },
+    {
+      "name": "tasks_scheduled",
+      "unit": "count",
+      "description": "Number of tasks offered by the TaskSource for the workload. Expected to be identical between baseline and treatment; deviations in executed vs. scheduled indicate interruptions."
+    },
+    {
+      "name": "error_rate_window_20",
+      "unit": "fraction",
+      "description": "Fraction of tasks that resulted in failure in the last 20 executed tasks. Used as a primary trigger for error-based circuit breaker opening."
+    },
+    {
+      "name": "rolling_mean_latency_window_10",
+      "unit": "milliseconds",
+      "description": "Mean latency of the last 10 tasks. Used as a primary trigger for latency-based circuit breaker opening."
+    },
+    {
+      "name": "policy_violation_events",
+      "unit": "count",
+      "description": "Number of tasks that emit policy_violation=True. Any positive count should be sufficient to trigger emergency shutdown in the treatment."
+    },
+    {
+      "name": "breaker_open_transitions",
+      "unit": "count",
+      "description": "Number of times the CircuitBreaker transitions from CLOSED or HALF_OPEN into OPEN state during a workload."
+    },
+    {
+      "name": "time_to_first_open",
+      "unit": "tasks",
+      "description": "Index (1-based count of executed tasks) at which the first OPEN transition occurs for a workload in the treatment. Not applicable to baseline."
+    },
+    {
+      "name": "shutdown_triggered",
+      "unit": "boolean",
+      "description": "Whether the EmergencyShutdownManager entered TERMINATED state at any point during a workload."
+    },
+    {
+      "name": "post_trigger_tasks_executed",
+      "unit": "count",
+      "description": "Number of tasks executed after the first breaker OPEN or shutdown activation. For correctly functioning treatment, this should be 0 or bounded by 1 control interval."
+    },
+    {
+      "name": "total_wall_clock_runtime",
+      "unit": "milliseconds",
+      "description": "Total runtime from workload start to completion or shutdown. Used for secondary assessment of performance overhead introduced by monitoring and breaker logic."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "For WL1_nominal_low_error, treatment and baseline execute the same number of tasks (tasks_executed == tasks_scheduled for both), with shutdown_triggered == False and breaker_open_transitions == 0.",
+      "For WL2_error_spike, the treatment\u2019s breaker_open_transitions >= 1 and tasks_executed_treatment < tasks_executed_baseline by at least the size of the post-spike phase (or similar), with shutdown_triggered == True or breaker remaining OPEN for remainder of workload.",
+      "For WL3_latency_surge, the treatment\u2019s breaker_open_transitions >= 1 when rolling_mean_latency_window_10 exceeds the configured threshold at least once, and tasks_executed_treatment < tasks_executed_baseline.",
+      "For WL4_immediate_policy_violation, the treatment activates emergency shutdown (shutdown_triggered == True) on or immediately after the policy_violation task and executes no further tasks afterward (post_trigger_tasks_executed <= 1), while baseline continues to execute all or most remaining tasks."
+    ],
+    "secondary": [
+      "Monitoring and breaker logic add less than a configurable overhead (e.g., < 20% increase) to total_wall_clock_runtime for WL1_nominal_low_error compared to baseline, under the same runtime conditions.",
+      "No false-positive breaker openings under WL1_nominal_low_error with the chosen thresholds.",
+      "No tasks are executed in treatment when EmergencyShutdownManager is in TERMINATED state (asserted by tests)."
+    ],
+    "interpretation_notes": [
+      "The experiment is designed to demonstrate behavioral differences and correctness of control logic, not to optimize for minimal overhead or to model real-world traffic distributions.",
+      "Exact numeric values for overhead and thresholds will depend on the concrete implementation; results should be reported as observed, without fabrication."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "silent_misconfiguration_of_thresholds",
+      "description": "If thresholds are misconfigured (e.g., error_rate_window_20 threshold too high or latency threshold too lenient), the breaker may never trip under realistic failure workloads.",
+      "detection": "WL2_error_spike and WL3_latency_surge show no breaker_open_transitions and no difference in tasks_executed between baseline and treatment.",
+      "mitigations": [
+        "Include configuration sanity tests that assert breakers trip under synthetic extreme conditions.",
+        "Expose thresholds via config file or environment variables and log them at startup.",
+        "Add unit tests using small deterministic sequences to assert when the breaker should trip."
+      ]
+    },
+    {
+      "name": "overly_sensitive_breaker",
+      "description": "Breaker trips under nominal workloads (WL1_nominal_low_error), causing unnecessary shutdowns and degraded availability.",
+      "detection": "breaker_open_transitions > 0 or shutdown_triggered == True during WL1_nominal_low_error.",
+      "mitigations": [
+        "Introduce hysteresis or minimum sample sizes for windows (e.g., require at least N>10 samples before tripping).",
+        "Implement separate thresholds for open and close transitions (e.g., open on error rate > 0.5, close only after error rate < 0.2 for a window).",
+        "Add tests for WL1 ensuring no openings occur with current thresholds."
+      ]
+    },
+    {
+      "name": "measurement_inconsistency_between_baseline_and_treatment",
+      "description": "If baseline and treatment use different metric collection paths or timing, comparisons of metrics or executed tasks may be invalid.",
+      "detection": "Discrepancies in tasks_scheduled vs. tasks_executed for baseline in nominal workloads, or structural differences in emitted logs.",
+      "mitigations": [
+        "Use the same MetricsRecorder and logging abstraction for both baseline and treatment.",
+        "Add tests to assert that metrics for identical executed task sequences match between baseline and treatment when breaker is disabled."
+      ]
+    },
+    {
+      "name": "bypassed_control_hooks",
+      "description": "Developer adds new tool invocation paths or agent behaviors that do not pass through the Monitor and CircuitBreaker, allowing unmonitored actions.",
+      "detection": "Static analysis or tests detect direct ToolRunner calls without going through MonitoredAgent; or logs show tasks with missing breaker_state_before/after fields.",
+      "mitigations": [
+        "Centralize tool invocation behind a single interface that is only accessible via the monitored wrapper.",
+        "Add tests that spy or mock ToolRunner to assert all invocations originate from MonitoredAgent.",
+        "Code review guidelines that explicitly forbid direct tool calls in orchestrator logic."
+      ]
+    },
+    {
+      "name": "deadlock_or_livelock_on_shutdown",
+      "description": "Shutdown procedures trigger but the system gets stuck in a loop trying to process tasks or retry, preventing clean termination.",
+      "detection": "Runtime appears to hang or tests with timeouts fail; logs show repeated breaker checks without progress.",
+      "mitigations": [
+        "Implement explicit TERMINATED state in EmergencyShutdownManager and short-circuit main loop when TERMINATED.",
+        "Use time-bound test assertions with sensible timeouts to detect hangs.",
+        "Keep shutdown logic side-effect-free and avoid waiting for external resources in the experiment implementation."
+      ]
+    }
+  ],
+  "required_environment": {
+    "language_and_runtime": [
+      "Python 3.10 or newer (3.11 recommended)."
+    ],
+    "dependencies": [
+      "pytest >= 7.0.0 for tests.",
+      "typing-extensions (if needed for backports of typing features).",
+      "Optional: rich or loguru for prettier logs (not required for core experiment; if used, must be declared explicitly)."
+    ],
+    "platform": [
+      "POSIX-like environment (Linux, macOS) or Windows; experiment should avoid OS-specific behavior.",
+      "No GPU or external AI APIs required; all agent and tool logic is simulated in pure Python."
+    ],
+    "repository_structure": [
+      "Create a directory `chapter_12_circuit_breakers/` in the repository root.",
+      "Within that directory, structure files as:\n- `agent.py` (SimpleAgent, MonitoredAgent, ToolRunner definitions)\n- `monitoring.py` (Monitor, MetricsRecorder, CircuitBreaker, EmergencyShutdownManager)\n- `workloads.py` (workload generation helpers for WL1\u2013WL4)\n- `run_experiments.py` (CLI or script to run baseline vs. treatment for each workload and emit logs/JSON)\n- `tests/test_circuit_breaker.py` (pytest tests described above)."
+    ]
+  },
+  "run_instructions": {
+    "setup": [
+      "Clone the repository: `git clone https://github.com/juancabreramware/ai-agent-on-a-leash.git`",
+      "Change into the repo directory: `cd ai-agent-on-a-leash`",
+      "Ensure Python 3.10+ is available: `python --version`.",
+      "Create and activate a virtual environment, e.g.: `python -m venv .venv && source .venv/bin/activate` (or `.venv\\Scripts\\activate` on Windows).",
+      "Install dependencies (example): `pip install -U pip pytest` plus any optional logging libraries used in the implementation."
+    ],
+    "running_experiments": [
+      "Navigate to the chapter directory: `cd chapter_12_circuit_breakers`.",
+      "Run the experiment script for all workloads: `python run_experiments.py --all`.",
+      "Alternatively, run a specific workload and mode:\n  - Baseline only: `python run_experiments.py --mode baseline --workload WL2_error_spike`\n  - Treatment only: `python run_experiments.py --mode treatment --workload WL2_error_spike`.",
+      "The script should output structured JSON or CSV results to a `results/` directory (e.g., `results/WL2_error_spike_baseline.json` and `results/WL2_error_spike_treatment.json`) and print a concise summary to stdout."
+    ],
+    "running_tests": [
+      "From the repository root or chapter directory, run: `pytest chapter_12_circuit_breakers -q`.",
+      "Tests should include:\n  - Unit tests for CircuitBreaker state transitions given synthetic metrics.\n  - Unit tests for Monitor window calculations.\n  - Integration tests that run a small subset of WL1\u2013WL4 programmatically and assert invariants (e.g., shutdown behavior, equality of tasks_executed under nominal load)."
+    ],
+    "interpreting_results": [
+      "For each workload, compare baseline vs. treatment using the generated result files or summaries.",
+      "Verify primary success criteria:\n  - WL1: tasks_executed_baseline == tasks_executed_treatment == tasks_scheduled; breaker_open_transitions_treatment == 0; shutdown_triggered_treatment == False.\n  - WL2: tasks_executed_treatment < tasks_executed_baseline; breaker_open_transitions_treatment >= 1; shutdown_triggered_treatment is True or breaker remains OPEN.\n  - WL3: tasks_executed_treatment < tasks_executed_baseline; at least one latency-based trigger where rolling_mean_latency_window_10 exceeds threshold.\n  - WL4: shutdown_triggered_treatment == True on or immediately after policy_violation_events >= 1; post_trigger_tasks_executed_treatment <= 1; baseline continues executing remaining tasks.",
+      "Inspect logs for breaker_state_before/after and policy_violation flags to confirm that control decisions align with observed metrics.",
+      "Document observed metrics and behaviors in the chapter text, clearly labeling them as experimental observations rather than theoretical guarantees."
+    ]
+  },
+  "evidence_schema": {
+    "per_run_record": {
+      "workload_name": "string (e.g., 'WL2_error_spike')",
+      "mode": "string ('baseline' | 'treatment')",
+      "config": {
+        "error_rate_threshold_window_20": "float",
+        "latency_threshold_window_10_ms": "float",
+        "window_sizes": {
+          "error_rate_window": "int",
+          "latency_window": "int"
+        },
+        "policy_violation_shutdown_enabled": "bool",
+        "max_tasks": "int"
+      },
+      "aggregate_metrics": {
+        "tasks_scheduled": "int",
+        "tasks_executed": "int",
+        "error_rate_overall": "float",
+        "error_rate_window_20": "float",
+        "rolling_mean_latency_window_10": "float",
+        "policy_violation_events": "int",
+        "breaker_open_transitions": "int",
+        "time_to_first_open": "int | null",
+        "shutdown_triggered": "bool",
+        "post_trigger_tasks_executed": "int",
+        "total_wall_clock_runtime_ms": "float"
+      },
+      "per_task_events": [
+        {
+          "task_index": "int (1-based)",
+          "task_id": "string",
+          "task_type": "string ('success' | 'slow' | 'failing' | 'policy_violation' | other variants)",
+          "start_time_iso": "string (ISO 8601 timestamp)",
+          "end_time_iso": "string (ISO 8601 timestamp)",
+          "latency_ms": "float",
+          "success": "bool",
+          "error_type": "string | null",
+          "policy_violation": "bool",
+          "breaker_state_before": "string ('CLOSED' | 'OPEN' | 'HALF_OPEN' | 'N/A' for baseline)",
+          "breaker_state_after": "string ('CLOSED' | 'OPEN' | 'HALF_OPEN' | 'N/A' for baseline)",
+          "shutdown_state": "string ('ACTIVE' | 'TERMINATED' | 'N/A' for baseline)"
+        }
+      ],
+      "notes": "string (optional free-text field for any additional annotations, e.g., implementation version, environment details)"
+    },
+    "comparison_record": {
+      "workload_name": "string",
+      "baseline_run_id": "string (e.g., UUID or filename)",
+      "treatment_run_id": "string",
+      "delta_metrics": {
+        "delta_tasks_executed": "int (treatment - baseline)",
+        "delta_total_wall_clock_runtime_ms": "float (treatment - baseline)",
+        "breaker_triggered": "bool (treatment breaker_open_transitions > 0 or shutdown_triggered == True)"
+      },
+      "interpretation": "string (human-written summary of whether results support or refute the hypothesis for this workload; must be filled in manually after running experiments, not auto-fabricated)."
+    }
+  }
+}

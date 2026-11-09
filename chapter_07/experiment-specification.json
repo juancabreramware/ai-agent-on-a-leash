@@ -1,0 +1,323 @@
+{
+  "experiment_id": "ch07-deterministic-state-machines-vs-free-form-agents",
+  "hypothesis": "For the same task and tool set, orchestrating an LLM-based agent through an explicitly defined deterministic state machine will (a) reduce the rate of invalid or out-of-order tool calls and (b) produce fully auditable, reproducible execution traces, compared to a free-form agent loop that relies only on prompts and ad-hoc parsing of the model's outputs.",
+  "baseline": {
+    "description": "A free-form, tool-using agent implemented as a generic reasoning loop. On each step, the LLM receives the conversation history and a textual description of available tools. It is asked to either call a tool (by emitting a structured JSON block) or provide a final answer. There is no explicit notion of workflow states, no deterministic transition table, and minimal validation beyond basic JSON parsing. The loop continues until the agent declares completion or a hard cap on steps is reached.",
+    "key_characteristics": [
+      "No first-class state machine representation (no enumerated states or transition table).",
+      "The LLM implicitly decides when to move between conceptual phases (e.g., clarify requirements, search, draft, review) based only on prompting.",
+      "The orchestrator accepts any syntactically valid tool invocation if it references a known tool, regardless of whether such an action is appropriate for a given phase.",
+      "Audit logs are linear sequences of messages and tool calls without explicit state labels; reconstructing the implicit workflow phases is manual and error-prone."
+    ],
+    "pseudocode_outline": [
+      "while not done and step < MAX_STEPS:",
+      "  send(history, tool_descriptions, instructions) -> model_response",
+      "  if model_response indicates tool_call:",
+      "      validate basic JSON, dispatch to tool, append tool result to history",
+      "  elif model_response indicates final_answer:",
+      "      done = True",
+      "  else:",
+      "      treat as thinking/clarification, append to history"
+    ]
+  },
+  "treatment": {
+    "description": "A state-machine-orchestrated agent where the workflow is represented as an explicit deterministic finite state machine (FSM). Each state has: (a) a name, (b) a set of allowed outgoing transitions with guard predicates, and (c) a limited set of allowed actions/tools. The orchestrator invokes the LLM only to choose among the allowed transitions and to generate content within the constraints of the current state. All transitions, guards, and side effects are implemented in Python and logged, ensuring determinism and auditability.",
+    "key_characteristics": [
+      "Finite, explicit set of workflow states such as: `COLLECT_REQUIREMENTS`, `PLAN`, `SEARCH`, `DRAFT`, `REVIEW`, `FINALIZE`.",
+      "Transitions defined declaratively in code (e.g., a transition table or configuration), with guards enforcing preconditions (e.g., 'cannot transition to FINALIZE if mandatory fields are missing').",
+      "In each state, only a subset of tools and actions are allowed; any attempt by the model to call a disallowed tool is rejected and logged, and the state does not change.",
+      "The orchestrator maintains a state variable and computes the next state based on: current state, LLM suggestion, guard checks, and deterministic resolution rules.",
+      "Every state entry, transition decision (including guard failures), and side effect is appended to a structured transition log for auditability."
+    ],
+    "pseudocode_outline": [
+      "state = INITIAL",
+      "while not state.is_terminal() and step < MAX_STEPS:",
+      "  allowed_transitions = fsm.get_allowed_transitions(state)",
+      "  allowed_tools = fsm.get_allowed_tools(state)",
+      "  send(history, state, allowed_transitions, allowed_tools) -> model_response",
+      "  parsed_intent = parse(model_response)  # desired transition + optional tool call",
+      "  if parsed_intent.tool and parsed_intent.tool in allowed_tools:",
+      "      dispatch tool, record effect",
+      "  next_state = deterministic_transition_resolution(state, parsed_intent, guards)",
+      "  log_transition(state, next_state, parsed_intent, guard_results)",
+      "  state = next_state"
+    ]
+  },
+  "workloads": [
+    {
+      "id": "wf-1-user-report-summarization",
+      "description": "Given a semi-structured 'user incident report' document, the agent must (1) extract key fields (title, severity, user_impact), (2) search a small local knowledge base (KB) for similar incidents, (3) draft a concise summary, and (4) produce a final, structured incident summary. Tools: `read_document`, `search_kb`, `write_summary` (mocked).",
+      "input_variants": [
+        {
+          "variant_id": "wf-1a-clear-incident",
+          "characteristics": "Well-structured incident report with clearly labeled sections and obvious severity."
+        },
+        {
+          "variant_id": "wf-1b-ambiguous-incident",
+          "characteristics": "Incident report mixing multiple issues, requiring clarification and careful extraction."
+        }
+      ]
+    },
+    {
+      "id": "wf-2-data-cleaning-plan",
+      "description": "Given a CSV schema and a short description of a data-quality issue, the agent must (1) restate the problem, (2) inspect example rows, (3) propose a step-by-step cleaning plan, and (4) generate a structured change-request artifact. Tools: `load_sample_rows`, `propose_transforms`, `submit_change_request` (mocked).",
+      "input_variants": [
+        {
+          "variant_id": "wf-2a-simple-missing-values",
+          "characteristics": "Simple null-value problems with clear remediation options."
+        },
+        {
+          "variant_id": "wf-2b-mixed-quality-issues",
+          "characteristics": "Mixed type inconsistencies and outliers, encouraging more complex reasoning."
+        }
+      ]
+    }
+  ],
+  "controls": {
+    "shared_model_and_tooling": [
+      "Use the same LLM model (e.g., `gpt-4.x` or configured open-source equivalent) with identical temperature, max_tokens, and other sampling parameters across baseline and treatment.",
+      "Use the same tool implementations and mock backends (identical Python functions) for both agents.",
+      "Use the same prompt fragments where possible; only add state-related context in the treatment condition."
+    ],
+    "randomness_and_reproducibility": [
+      "Configure deterministic settings where supported by the chosen model API (e.g., `temperature=0` if acceptable for the demonstration tasks).",
+      "Seed any local sources of randomness in Python (e.g., `random.seed`, `numpy.random.seed`) before each run.",
+      "Run each (workload, variant, condition) pair multiple times (e.g., N=3) to ensure consistency and to detect any residual non-determinism."
+    ],
+    "orchestrator_limits": [
+      "Use the same maximum number of reasoning/tool steps per episode (e.g., `MAX_STEPS = 10`) in both baseline and treatment.",
+      "Apply the same global timeout per run (wall-clock limit) for fairness.",
+      "Use identical error-handling behaviors for tool failures (e.g., retry policy disabled for both)."
+    ],
+    "evaluation_protocol": [
+      "Define a deterministic post-hoc evaluator implemented in Python (no LLM in the loop) to classify each step as 'valid' or 'invalid' according to pre-specified rules based on logs.",
+      "The evaluator must be blind to whether a run came from baseline or treatment; it operates solely on logged sequences of actions and tool calls plus state labels (if any).",
+      "Use a consistent log schema for both conditions to simplify analysis (treatment logs can include additional `state` and `transition` fields, but core fields like `step_index`, `tool_name`, `tool_args` must be common)."
+    ]
+  },
+  "metrics": [
+    {
+      "name": "invalid_tool_call_rate",
+      "unit": "fraction_per_run",
+      "description": "Number of invalid tool calls (e.g., syntactically malformed requests, unknown tools, calls outside of allowed semantic phase) divided by total tool-call attempts in a run. Computed independently for each condition."
+    },
+    {
+      "name": "out_of_order_action_rate",
+      "unit": "fraction_per_run",
+      "description": "Fraction of episodes where the agent performs a tool call in a semantically disallowed order, as defined by a reference workflow (e.g., calling `submit_change_request` before any `propose_transforms`). For the treatment, this should be enforced to zero by the FSM if correctly implemented."
+    },
+    {
+      "name": "episode_completion_rate",
+      "unit": "fraction_of_runs",
+      "description": "Fraction of runs that reach a valid terminal condition (final answer or terminal state) within the allowed step budget without hitting errors or being aborted."
+    },
+    {
+      "name": "average_steps_per_successful_episode",
+      "unit": "steps",
+      "description": "Mean number of reasoning/tool steps over successfully completed runs (episodes that reached completion without fatal errors). Used to check whether the state machine introduces significant extra steps."
+    },
+    {
+      "name": "audit_trace_completeness",
+      "unit": "boolean_per_run",
+      "description": "Binary indicator computed by a log validator: true if the run's log contains a complete, gap-free sequence of events with all required fields (step_index, timestamp, tool/action, input, output, and, for treatment, state and transition) and no parsing failures; false otherwise."
+    },
+    {
+      "name": "state_transition_guard_violations",
+      "unit": "count_per_run",
+      "description": "Number of times in the treatment condition that the LLM proposes an action or state transition that is rejected by a guard (e.g., due to missing prerequisites). This should be non-zero in adversarial or ambiguous scenarios and demonstrates the constraining effect."
+    }
+  ],
+  "success_criteria": {
+    "primary": [
+      "The treatment (state-machine-orchestrated agent) must achieve an `out_of_order_action_rate` of 0 across all successful episodes, as the deterministic FSM should prohibit invalid action ordering by construction.",
+      "The treatment must achieve an `audit_trace_completeness` of true for 100% of runs, verified by the log validator, indicating that every transition and action is recorded in a structured, machine-readable format."
+    ],
+    "secondary": [
+      "The treatment should exhibit a strictly lower `invalid_tool_call_rate` than the baseline across all workloads and variants, or at least not higher, indicating improved constraint and validation.",
+      "The `episode_completion_rate` for the treatment should be within 10 percentage points of the baseline for each workload variant; if the treatment completes fewer episodes, the difference should be explainable (e.g., stricter enforcement aborting flawed workflows).",
+      "The `average_steps_per_successful_episode` for the treatment should not exceed the baseline by more than 30% on average, maintaining reasonable efficiency while adding determinism."
+    ],
+    "interpretation_notes": [
+      "If the baseline already behaves nearly ideally on simpler workloads (e.g., no invalid ordering observed), the experiment still provides value by showing that the treatment enforces constraints mechanically rather than by accident.",
+      "Any differences in completion rate or steps should be analyzed qualitatively in the chapter text, with examples from logs illustrating the tradeoff between flexibility and safety."
+    ]
+  },
+  "failure_modes": [
+    {
+      "name": "fsm_design_errors",
+      "description": "Bugs or omissions in the state machine definition (e.g., missing transition from `PLAN` to `SEARCH`, incorrect guard logic) can prevent the agent from completing tasks or can incorrectly block safe actions, skewing results.",
+      "mitigations": [
+        "Create unit tests for the FSM itself (transition table, guards, terminal states) independent of any LLM calls.",
+        "Validate the FSM using a small set of scripted, non-LLM test drivers that simulate typical workflows."
+      ]
+    },
+    {
+      "name": "prompt_leakage_of_state_logic",
+      "description": "If the FSM logic is described too verbosely in prompts, the baseline agent could learn to approximate stateful behavior even without an explicit orchestrator, reducing the measured difference between conditions.",
+      "mitigations": [
+        "For the baseline, provide only high-level task instructions and tool descriptions; avoid explicit enumeration of phases or state-transition rules.",
+        "For the treatment, provide only minimal state-related hints necessary for the model to choose among pre-defined transitions."
+      ]
+    },
+    {
+      "name": "non_deterministic_model_behavior",
+      "description": "Stochastic outputs from the LLM can cause variability in measured metrics between runs, obscuring the effect of the state machine.",
+      "mitigations": [
+        "Use deterministic settings where possible (e.g., `temperature=0`).",
+        "Run multiple repetitions per condition and workload variant, and report variability descriptively in the chapter (without fabricating statistics)."
+      ]
+    },
+    {
+      "name": "evaluation_bias",
+      "description": "If the evaluator uses knowledge about the implementation or includes implicit assumptions that favor one condition, the comparison may be biased.",
+      "mitigations": [
+        "Implement a purely rule-based evaluator using only logs and a separate configuration file describing allowed action orders and required outputs.",
+        "Use the same evaluator for baseline and treatment, ignoring treatment-only fields (state, guards) when computing core metrics."
+      ]
+    },
+    {
+      "name": "log_schema_drift",
+      "description": "Inconsistent log formats between baseline and treatment can hinder comparison or cause analysis scripts to fail.",
+      "mitigations": [
+        "Define a shared log schema and a logger utility module used by both implementations.",
+        "Add tests that load and validate logs against a JSON Schema or pydantic model."
+      ]
+    }
+  ],
+  "required_environment": {
+    "language_and_runtime": [
+      "Python 3.10 or later"
+    ],
+    "dependencies": [
+      "pytest (for tests)",
+      "pydantic or dataclasses-json (for log record validation, optional but recommended)",
+      "httpx or requests (if interacting with an external LLM API)",
+      "A configured LLM client library or thin wrapper around the chosen model API (e.g., OpenAI, Azure OpenAI, local model server)."
+    ],
+    "system_requirements": [
+      "Network access to the configured LLM endpoint, unless running a local model.",
+      "Sufficient disk space to store logs for all runs (expected to be small for chapter-scale experiments)."
+    ],
+    "repository_layout": [
+      "Repository root: `https://github.com/juancabreramware/ai-agent-on-a-leash`",
+      "Chapter directory: `chapters/07_deterministic_state_machines/`",
+      "Recommended substructure:",
+      "  - `agent_freeform.py`   # baseline agent implementation",
+      "  - `agent_fsm.py`        # treatment agent with explicit state machine",
+      "  - `fsm_definition.py`   # state and transition definitions, guards, and effects",
+      "  - `tools.py`            # shared mock tool implementations for both agents",
+      "  - `workloads.py`        # workload definitions and input fixtures",
+      "  - `runner.py`           # script to execute experiments and produce logs",
+      "  - `evaluation.py`       # metrics computation and log analysis",
+      "  - `tests/`              # pytest-based tests, including adversarial scenarios",
+      "  - `README.md`           # experiment description, how to run, and how to interpret results"
+    ]
+  },
+  "run_instructions": [
+    "1. Clone the repository and navigate to the chapter directory:",
+    "   git clone https://github.com/juancabreramware/ai-agent-on-a-leash.git",
+    "   cd ai-agent-on-a-leash/chapters/07_deterministic_state_machines",
+    "",
+    "2. Create and activate a virtual environment (optional but recommended):",
+    "   python -m venv .venv",
+    "   source .venv/bin/activate  # on Windows: .venv\\\\Scripts\\\\activate",
+    "",
+    "3. Install Python dependencies for this chapter (exact package list will be specified in `requirements.txt` or `pyproject.toml` within this directory):",
+    "   pip install -r requirements.txt",
+    "",
+    "4. Configure LLM access:",
+    "   - Follow the instructions in `README.md` to set environment variables with API keys or model endpoints (e.g., `OPENAI_API_KEY`, `MODEL_ENDPOINT`).",
+    "   - Optionally, configure a local mock model for offline testing; if provided, instructions will be in the README.",
+    "",
+    "5. Run automated tests (both unit tests of the FSM and integration tests with the agents):",
+    "   pytest -q",
+    "",
+    "   These tests will cover:",
+    "   - FSM correctness (reachable terminal states, allowed transitions, guard behavior).",
+    "   - Baseline agent behavior on simple workloads.",
+    "   - Treatment agent behavior on the same workloads.",
+    "   - Adversarial scenarios where the model attempts to skip states or call disallowed tools.",
+    "",
+    "6. Execute the comparative experiment runs to generate logs:",
+    "   # Example command; final interface will be documented in README",
+    "   python runner.py --mode both --workload wf-1 --variants wf-1a wf-1b --repetitions 3 --output-dir logs/",
+    "",
+    "   You can similarly run:",
+    "   python runner.py --mode baseline --workload wf-2 --variants wf-2a wf-2b --repetitions 3 --output-dir logs_baseline/",
+    "   python runner.py --mode treatment --workload wf-2 --variants wf-2a wf-2b --repetitions 3 --output-dir logs_treatment/",
+    "",
+    "   Each run should produce structured JSONL logs (one event per line) with filenames encoding condition, workload, variant, and repetition index.",
+    "",
+    "7. Compute metrics from generated logs using the evaluation script:",
+    "   python evaluation.py --input-dir logs/ --output metrics_summary.json",
+    "",
+    "   The evaluator will:",
+    "   - Load logs from both baseline and treatment runs.",
+    "   - Validate them against the shared schema.",
+    "   - Compute the metrics defined in this specification.",
+    "   - Write a machine-readable summary to `metrics_summary.json` and a human-readable report to stdout.",
+    "",
+    "8. Interpret results:",
+    "   - Open `metrics_summary.json` and compare values of each metric for baseline vs. treatment.",
+    "   - Use the guidance in the chapter text and README to understand whether the treatment meets the success criteria.",
+    "   - Inspect a few representative logs (especially runs with guard violations or aborted workflows) to see concrete examples of the FSM constraining behavior.",
+    "",
+    "Note: Do not assume any specific numeric outcome in advance. The chapter and README must clearly differentiate illustrative expectations from actual results obtained in your environment."
+  ],
+  "evidence_schema": {
+    "log_event_record": {
+      "type": "object",
+      "description": "Single event record for either baseline or treatment run, stored as one JSON object per line in a JSONL log.",
+      "required_fields": {
+        "run_id": "string; unique identifier per full agent episode (same for all events in that episode).",
+        "condition": "string; one of ['baseline', 'treatment'].",
+        "workload_id": "string; e.g., 'wf-1' or 'wf-2'.",
+        "variant_id": "string; e.g., 'wf-1a'.",
+        "step_index": "integer; monotonically increasing within a run, starting at 0.",
+        "timestamp": "string; ISO 8601 datetime indicating when the event was recorded.",
+        "event_type": "string; e.g., 'model_call', 'tool_call', 'tool_result', 'state_transition', 'guard_violation', 'final_answer'.",
+        "payload": "object; event-specific data such as model prompt, model output (possibly redacted), tool name, arguments, results, and evaluation tags."
+      },
+      "optional_fields": {
+        "state_before": "string; name of FSM state before the event (treatment only).",
+        "state_after": "string; name of FSM state after the event (treatment only, especially for 'state_transition' events).",
+        "transition_name": "string; logical name of the transition (treatment only).",
+        "guard_results": "object; mapping from guard name to boolean result and optional details (treatment only).",
+        "error": "object; if the event represents an error, structured description including error_type and message."
+      }
+    },
+    "metrics_summary_record": {
+      "type": "object",
+      "description": "Aggregated metrics for a given (condition, workload_id, variant_id) triple.",
+      "required_fields": {
+        "condition": "string; 'baseline' or 'treatment'.",
+        "workload_id": "string; as defined in workloads.",
+        "variant_id": "string; as defined in workloads.",
+        "num_runs": "integer; number of runs aggregated for this record.",
+        "invalid_tool_call_rate": "number; as defined in metrics, averaged over runs.",
+        "out_of_order_action_rate": "number; as defined in metrics, averaged over runs.",
+        "episode_completion_rate": "number; fraction between 0 and 1.",
+        "average_steps_per_successful_episode": "number; average integer or float.",
+        "audit_trace_completeness_rate": "number; fraction of runs where `audit_trace_completeness` is true.",
+        "mean_state_transition_guard_violations": "number; average count per run for treatment; 0 or omitted for baseline."
+      },
+      "optional_fields": {
+        "notes": "string; free-text field for any manual observations or caveats the experimenter wishes to attach (should not be auto-generated by code unless clearly labeled)."
+      }
+    },
+    "test_artifacts": {
+      "fsm_tests": "pytest test files verifying FSM structure, transitions, and guards independent of LLM calls.",
+      "agent_tests": "pytest test files driving both agents on simplified or mocked workloads to verify basic correctness and logging behavior.",
+      "adversarial_tests": "pytest test files configuring the LLM or mock model to attempt invalid transitions or unsafe shortcuts, ensuring guards and FSM constraints are exercised."
+    },
+    "documentation_artifacts": {
+      "README_sections": [
+        "Environment setup and dependency installation.",
+        "Description of baseline and treatment implementations and how they map to the conceptual pattern.",
+        "Exact commands to run tests and experiments.",
+        "How to parse and interpret logs and metrics, including schema references.",
+        "Clear statement that all reported results must be generated by actually running the code; no fabricated metrics."
+      ]
+    }
+  }
+}
